@@ -1,0 +1,14 @@
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+compile_commands.json
+.cache/
+received/
+test_files/
+*.partial
+*.bin
+*.iso
+perf.data*
+.vscode/
