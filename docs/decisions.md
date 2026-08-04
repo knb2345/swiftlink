@@ -38,3 +38,44 @@ line, exit non-zero. Registered with CTest.
 A defaulted move would member-wise copy the `int fd_` and leave the source
 still owning it, so both destructors would `close()` the same descriptor.
 Defaulted moves are only safe for members that clear themselves when moved from.
+
+## 2026-08-04 — M2: no handshake; server takes the output path on the CLI
+Milestone 2's scope is stop-and-wait reliability, not session setup. Rather
+than invent a half-handshake that milestone 4 would then replace, the server is
+told its output path as an argument and the transfer is DATA/ACK plus a final
+FIN. START/START_ACK/FIN_ACK, session IDs and filename negotiation land in M4
+as specified. Deviation from the strict file layout: none; deviation from a
+"complete" transfer protocol: deliberate, and confined to this milestone.
+
+## 2026-08-04 — pread/pwrite instead of read/write plus lseek
+Positional I/O carries the offset as an argument instead of mutating the
+descriptor's shared file offset. Chunks can therefore be written in any order
+(which milestone 3 requires), duplicate chunks rewrite the same bytes at the
+same place so a retransmission cannot corrupt the file, and there is no
+per-descriptor cursor for milestone 5's concurrent sessions to race on.
+
+## 2026-08-04 — 1200-byte chunks
+1200 + 40 = 1240 bytes on the wire, under the 1500-byte Ethernet MTU even after
+20 bytes of IPv4 and 8 of UDP header, with room for VPN or PPPoE encapsulation.
+Avoiding IP fragmentation matters because a fragmented datagram is lost entirely
+if any single fragment is lost, which would multiply the effective loss rate.
+Loopback's MTU is 65536 so nothing fragments during local benchmarking anyway;
+the number is chosen for the real-network case.
+
+## 2026-08-04 — SO_RCVTIMEO for the retransmission timer
+With one packet in flight, a receive timeout is the whole timer implementation:
+recvfrom returns EAGAIN and the sender retransmits. The deadline is recomputed
+on each stray packet rather than restarting the full RTO, so an unrelated
+sender cannot postpone a retransmission indefinitely. Milestone 5 replaces this
+with epoll, which is the only way to wait on several sessions at once.
+
+## 2026-08-04 — The receiver ACKs duplicates instead of ignoring them
+A duplicate DATA packet means the sender never saw our ACK. Discarding it
+silently would deadlock the transfer: the sender times out again, resends
+again, and the receiver stays quiet each time. Re-acknowledging is what breaks
+the loop.
+
+## 2026-08-04 — Simulated loss counts as "sent"
+A dropped datagram still increments packets_sent, because the sender's state
+machine believes it sent it -- that is exactly what makes the simulation
+faithful. simulated_drops is reported separately so the two are never confused.

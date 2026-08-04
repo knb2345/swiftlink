@@ -46,15 +46,42 @@ target_include_directories(swiftlink_net PUBLIC
 target_link_libraries(swiftlink_net PRIVATE swiftlink_warnings)
 
 # ---------------------------------------------------------------------------
-# Executables: the only place the two layers are wired together.
+# IO: RAII file descriptor with positional (pread/pwrite) access.
+# ---------------------------------------------------------------------------
+add_library(swiftlink_io STATIC
+  src/io/file.cpp)
+
+target_include_directories(swiftlink_io PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+target_link_libraries(swiftlink_io PRIVATE swiftlink_warnings)
+
+# ---------------------------------------------------------------------------
+# Transfer: the reliability layer. Sits above protocol, net and io, and is the
+# first layer that knows what a "file transfer" is.
+# ---------------------------------------------------------------------------
+add_library(swiftlink_transfer STATIC
+  src/transfer/transfer.cpp
+  src/transfer/sender.cpp
+  src/transfer/receiver.cpp)
+
+target_include_directories(swiftlink_transfer PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+target_link_libraries(swiftlink_transfer
+  PUBLIC swiftlink_protocol swiftlink_net swiftlink_io
+  PRIVATE swiftlink_warnings)
+
+# ---------------------------------------------------------------------------
+# Executables: the only place the layers are wired together.
 # ---------------------------------------------------------------------------
 add_executable(swiftlink_server src/server/server_main.cpp)
 target_link_libraries(swiftlink_server
-  PRIVATE swiftlink_protocol swiftlink_net swiftlink_warnings)
+  PRIVATE swiftlink_transfer swiftlink_warnings)
 
 add_executable(swiftlink_client src/client/client_main.cpp)
 target_link_libraries(swiftlink_client
-  PRIVATE swiftlink_protocol swiftlink_net swiftlink_warnings)
+  PRIVATE swiftlink_transfer swiftlink_warnings)
 
 # ---------------------------------------------------------------------------
 # Tests. Hand-rolled harness -- the project takes no external dependencies, so

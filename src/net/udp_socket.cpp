@@ -97,6 +97,22 @@ void UdpSocket::close() noexcept {
   }
 }
 
+bool UdpSocket::set_receive_timeout(std::chrono::microseconds timeout) noexcept {
+  if (!valid()) {
+    errno = EBADF;
+    return false;
+  }
+
+  // SO_RCVTIMEO takes a struct timeval. Splitting the duration with chrono's
+  // duration_cast keeps the seconds/microseconds arithmetic honest.
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(timeout);
+  timeval tv{};
+  tv.tv_sec = static_cast<time_t>(seconds.count());
+  tv.tv_usec = static_cast<suseconds_t>((timeout - seconds).count());
+
+  return ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+}
+
 std::ptrdiff_t UdpSocket::send_to(std::span<const std::byte> bytes,
                                   const Endpoint& destination) noexcept {
   if (!valid()) {

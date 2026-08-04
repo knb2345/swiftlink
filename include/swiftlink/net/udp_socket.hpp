@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -61,6 +62,16 @@ class UdpSocket {
 
   // Explicit close. Safe to call repeatedly; the destructor calls it too.
   void close() noexcept;
+
+  // SO_RCVTIMEO: recv_from gives up after `timeout` and fails with EAGAIN
+  // (== EWOULDBLOCK) instead of blocking forever. This is how the stop-and-wait
+  // sender implements its retransmission timeout while staying on a blocking
+  // socket. A zero timeout restores indefinite blocking.
+  //
+  // Milestone 5 replaces this with a non-blocking socket driven by epoll, which
+  // is the only way to wait on several sessions at once. For one packet in
+  // flight, a receive timeout is simpler and does the same job.
+  [[nodiscard]] bool set_receive_timeout(std::chrono::microseconds timeout) noexcept;
 
   [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
   [[nodiscard]] int fd() const noexcept { return fd_; }

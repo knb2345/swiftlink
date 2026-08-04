@@ -1,77 +1,101 @@
-// Milestone 1 server: bind a UDP port, block until one datagram arrives,
-// decode it, print every header field, exit.
+// Milestone 2 server: receive one file, write it, print statistics, exit.
 //
-// No loop, no concurrency, no epoll -- those are later milestones.
+//   swiftlink_server <port> <output-file> [--idle-ms=N] [--quiet]
+//
+// One transfer per process, sequentially. Concurrency arrives in milestone 5
+// with epoll; until then the point is the reliability logic, not the plumbing.
 
 #include <cerrno>
 #include <charconv>
-#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iostream>
 #include <string>
-#include <vector>
+#include <string_view>
 
 #include "swiftlink/net/udp_socket.hpp"
-#include "swiftlink/protocol/packet.hpp"
+#include "swiftlink/transfer/receiver.hpp"
+#include "swiftlink/transfer/transfer.hpp"
 
 namespace {
 
-constexpr std::uint16_t kDefaultPort = 9000;
+namespace xfer = swiftlink::transfer;
 
-[[nodiscard]] bool parse_port(const char* text, std::uint16_t& out) {
-  const std::string_view view{text};
-  unsigned value = 0;
+struct Options {
+  std::uint16_t port = 9000;
+  std::string output_path;
+  xfer::ReceiverConfig receiver;
+  bool quiet = false;
+};
+
+[[nodiscard]] bool parse_unsigned(std::string_view text, unsigned long long& out) {
   const auto result =
-      std::from_chars(view.data(), view.data() + view.size(), value);
-  if (result.ec != std::errc{} || result.ptr != view.data() + view.size() ||
-      value == 0 || value > 65535) {
+      std::from_chars(text.data(), text.data() + text.size(), out);
+  return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+}
+
+[[nodiscard]] bool parse_options(int argc, char** argv, Options& options) {
+  int positional = 0;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg{argv[i]};
+
+    if (arg.starts_with("--")) {
+      const std::size_t equals = arg.find('=');
+      const std::string_view name = arg.substr(0, equals);
+      const std::string_view value =
+          (equals == std::string_view::npos) ? std::string_view{}
+                                             : arg.substr(equals + 1);
+
+      if (name == "--quiet") {
+        options.quiet = true;
+      } else if (name == "--idle-ms") {
+        unsigned long long ms = 0;
+        if (!parse_unsigned(value, ms) || ms == 0) {
+          std::cerr << "--idle-ms expects a positive integer\n";
+          return false;
+        }
+        options.receiver.idle_timeout =
+            std::chrono::milliseconds{static_cast<long>(ms)};
+      } else {
+        std::cerr << "unknown option: " << arg << '\n';
+        return false;
+      }
+      continue;
+    }
+
+    switch (positional++) {
+      case 0: {
+        unsigned long long port = 0;
+        if (!parse_unsigned(arg, port) || port == 0 || port > 65535) {
+          std::cerr << "invalid port: " << arg << '\n';
+          return false;
+        }
+        options.port = static_cast<std::uint16_t>(port);
+        break;
+      }
+      case 1:
+        options.output_path = arg;
+        break;
+      default:
+        std::cerr << "unexpected argument: " << arg << '\n';
+        return false;
+    }
+  }
+
+  if (positional < 2) {
+    std::cerr << "usage: swiftlink_server <port> <output-file> "
+                 "[--idle-ms=N] [--quiet]\n";
     return false;
   }
-  out = static_cast<std::uint16_t>(value);
   return true;
-}
-
-// Renders a payload as text, replacing anything unprintable with '.' so a
-// binary payload cannot scramble the terminal.
-[[nodiscard]] std::string printable(std::span<const std::byte> payload) {
-  std::string text;
-  text.reserve(payload.size());
-  for (const std::byte b : payload) {
-    const auto c = static_cast<unsigned char>(b);
-    text.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
-  }
-  return text;
-}
-
-void print_header(const swiftlink::protocol::PacketHeader& h) {
-  using swiftlink::protocol::to_string;
-  std::cout << std::format("  magic                   0x{:08X}\n", h.magic);
-  std::cout << std::format("  version                 {}\n", h.version);
-  std::cout << std::format("  packet_type             {} ({})\n",
-                           static_cast<unsigned>(h.packet_type),
-                           to_string(h.packet_type));
-  std::cout << std::format("  header_length           {}\n", h.header_length);
-  std::cout << std::format("  session_id              {}\n", h.session_id);
-  std::cout << std::format("  sequence_number         {}\n", h.sequence_number);
-  std::cout << std::format("  acknowledgement_number  {}\n",
-                           h.acknowledgement_number);
-  std::cout << std::format("  byte_offset             {}\n", h.byte_offset);
-  std::cout << std::format("  payload_length          {}\n", h.payload_length);
-  std::cout << std::format("  flags                   0x{:04X}\n", h.flags);
-  std::cout << std::format("  checksum                0x{:08X}\n", h.checksum);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::uint16_t port = kDefaultPort;
-  if (argc > 2) {
-    std::cerr << "usage: swiftlink_server [port]\n";
-    return 2;
-  }
-  if (argc == 2 && !parse_port(argv[1], port)) {
-    std::cerr << std::format("invalid port: {}\n", argv[1]);
+  Options options;
+  if (!parse_options(argc, argv, options)) {
     return 2;
   }
 
@@ -80,47 +104,35 @@ int main(int argc, char** argv) {
     std::cerr << std::format("socket() failed: {}\n", std::strerror(errno));
     return 1;
   }
-  if (!socket.bind(port)) {
-    std::cerr << std::format("bind({}) failed: {}\n", port,
+  if (!socket.bind(options.port)) {
+    std::cerr << std::format("bind({}) failed: {}\n", options.port,
                              std::strerror(errno));
     return 1;
   }
 
-  std::cout << std::format("swiftlink server listening on 0.0.0.0:{}\n", port);
-  std::cout << "waiting for one datagram...\n";
+  if (!options.quiet) {
+    std::cout << std::format("swiftlink server on 0.0.0.0:{} -> {}\n",
+                             options.port, options.output_path);
+  }
+  // Unbuffered, so a benchmark script can wait for this line before starting
+  // the client and know the socket is genuinely bound.
+  std::cout << "READY" << std::endl;
 
-  // Sized for the largest packet the format can describe, so a legitimate
-  // packet is never silently truncated by recvfrom.
-  std::vector<std::byte> buffer(swiftlink::protocol::kHeaderWireSize +
-                                swiftlink::protocol::kMaxPayloadSize);
+  xfer::TransferStats stats;
+  const xfer::TransferError error = xfer::receive_file(
+      socket, options.output_path, options.receiver, stats);
 
-  swiftlink::net::Endpoint peer;
-  const std::ptrdiff_t received = socket.recv_from(buffer, peer);
-  if (received < 0) {
-    std::cerr << std::format("recvfrom() failed: {}\n", std::strerror(errno));
+  if (error != xfer::TransferError::kNone) {
+    std::cerr << std::format("receive failed: {}\n", xfer::to_string(error));
     return 1;
   }
 
-  std::cout << std::format("\nreceived {} bytes from {}:{}\n", received,
-                           peer.address, peer.port);
-
-  // Trim to what actually arrived: the rest of `buffer` is untouched zeroes and
-  // must not be fed to the decoder, or payload_length validation would fail.
-  const std::span<const std::byte> datagram{buffer.data(),
-                                            static_cast<std::size_t>(received)};
-
-  const auto result = swiftlink::protocol::deserialize(datagram);
-  if (!result.ok()) {
-    std::cerr << std::format("decode failed: {}\n",
-                             swiftlink::protocol::to_string(result.error()));
-    return 1;
-  }
-
-  const swiftlink::protocol::Packet& packet = result.value();
-  std::cout << "\nheader:\n";
-  print_header(packet.header);
-  std::cout << std::format("\npayload ({} bytes): \"{}\"\n",
-                           packet.payload.size(), printable(packet.payload));
+  std::cout << std::format(
+      "STATS elapsed_s={:.4f} throughput_mbps={:.3f} bytes={} chunks={} "
+      "packets_received={} duplicates={} out_of_order={}\n",
+      stats.elapsed_seconds, stats.throughput_mbps(), stats.bytes_transferred,
+      stats.chunks, stats.packets_received, stats.duplicates_received,
+      stats.out_of_order_received);
 
   return 0;
 }
