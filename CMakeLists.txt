@@ -94,3 +94,11 @@ target_link_libraries(protocol_tests
   PRIVATE swiftlink_protocol swiftlink_warnings)
 
 add_test(NAME protocol_tests COMMAND protocol_tests)
+
+# ---------------------------------------------------------------------------
+# Benchmark tooling. Not part of the transfer system: delay_proxy exists only
+# because this development kernel is built without netem (see the comment at
+# the top of tools/delay_proxy.cpp).
+# ---------------------------------------------------------------------------
+add_executable(delay_proxy tools/delay_proxy.cpp)
+target_link_libraries(delay_proxy PRIVATE swiftlink_warnings)

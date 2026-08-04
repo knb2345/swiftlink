@@ -79,3 +79,22 @@ the loop.
 A dropped datagram still increments packets_sent, because the sender's state
 machine believes it sent it -- that is exactly what makes the simulation
 faithful. simulated_drops is reported separately so the two are never confused.
+
+## 2026-08-04 — netem unavailable; delay emulated in userspace instead
+The M2 benchmark plan specified `tc qdisc add dev lo root netem delay 25ms`.
+This WSL2 kernel is built without it: `zcat /proc/config.gz | grep
+NET_SCH_NETEM` reports `# CONFIG_NET_SCH_NETEM is not set`, and `modinfo
+sch_netem` finds no module, so the command fails at any privilege level.
+Substitute: `tools/delay_proxy.cpp`, a single-threaded UDP relay holding each
+datagram in a release-time min-heap and forwarding it via ppoll(). Its RTT was
+measured (26.4ms for a nominal 25ms), not assumed. It cannot reorder, duplicate
+or corrupt packets, so it emulates delay only. Flagged in docs/benchmarks.md.
+Note that `netem delay 25ms` on lo would have given ~50ms RTT, since loopback
+traverses the qdisc in both directions; the proxy is configured by one-way
+delay so the resulting RTT is stated rather than inferred.
+
+## 2026-08-04 — Benchmarks verify every run, and record runs not averages
+Each benchmark run compares the received file's SHA-256 against the source and
+reports FAILED rather than a number if they differ. A throughput figure from a
+transfer that did not reproduce the file is worse than no figure. All three
+runs per condition are recorded individually so variance is visible.
