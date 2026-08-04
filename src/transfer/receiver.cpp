@@ -1,34 +1,34 @@
+// Blocking driver for ReceiverSession (milestone 3).
+//
+// All the reliability logic lives in ReceiverSession; this file only moves
+// bytes between the socket and that state machine. Milestone 5 replaces it
+// with an epoll driver that runs many sessions at once, without touching the
+// session logic itself.
+
 #include "swiftlink/transfer/receiver.hpp"
 
 #include <cerrno>
 #include <chrono>
 #include <vector>
 
-#include "swiftlink/io/file.hpp"
 #include "swiftlink/protocol/packet.hpp"
+#include "swiftlink/transfer/receiver_session.hpp"
 
 namespace swiftlink::transfer {
 namespace {
 
 namespace proto = swiftlink::protocol;
-using Clock = std::chrono::steady_clock;
 
-// Builds and sends a bare ACK for `sequence` back to `peer`.
-//
-// The acknowledgement is unconditional: the receiver ACKs every DATA packet it
-// accepts *and* every duplicate it discards. Silently dropping a duplicate
-// without re-acknowledging it would deadlock the transfer, because the reason
-// the sender resent it is that the first ACK never arrived -- staying quiet
-// would just make it time out again.
-[[nodiscard]] bool send_ack(net::UdpSocket& socket, const net::Endpoint& peer,
-                            std::uint64_t session_id, std::uint32_t sequence) {
-  proto::PacketHeader ack;
-  ack.packet_type = proto::PacketType::kAck;
-  ack.session_id = session_id;
-  ack.sequence_number = sequence;
-  ack.acknowledgement_number = sequence;
+[[nodiscard]] bool send_reply(net::UdpSocket& socket, const net::Endpoint& peer,
+                             const ReceiverSession::Reply& reply,
+                             std::uint64_t session_id) {
+  proto::PacketHeader header;
+  header.packet_type = reply.type;
+  header.session_id = session_id;
+  header.sequence_number = reply.sequence;
+  header.acknowledgement_number = reply.sequence;
 
-  const std::vector<std::byte> wire = proto::serialize(ack, {});
+  const std::vector<std::byte> wire = proto::serialize(header, {});
   return socket.send_to(wire, peer) >= 0;
 }
 
@@ -37,9 +37,9 @@ using Clock = std::chrono::steady_clock;
 TransferError receive_file(net::UdpSocket& socket,
                            const std::string& output_path,
                            const ReceiverConfig& config, TransferStats& stats) {
-  io::File file;
-  if (!file.open_write(output_path)) {
-    return TransferError::kFileOpenFailed;
+  ReceiverSession session(config.window_size);
+  if (!session.open(output_path)) {
+    return session.error();
   }
 
   if (!socket.set_receive_timeout(
@@ -50,16 +50,10 @@ TransferError receive_file(net::UdpSocket& socket,
 
   std::vector<std::byte> buffer(proto::kHeaderWireSize + proto::kMaxPayloadSize);
 
-  // The next sequence number we have not yet written. Under stop-and-wait this
-  // advances by exactly one per accepted chunk; milestone 3 replaces it with a
-  // window base.
-  std::uint32_t expected = 0;
-  std::uint64_t bytes_written = 0;
-
   bool timing_started = false;
-  Clock::time_point started{};
+  TimePoint started{};
 
-  for (;;) {
+  while (!session.finished()) {
     net::Endpoint peer;
     const std::ptrdiff_t received = socket.recv_from(buffer, peer);
     if (received < 0) {
@@ -73,80 +67,35 @@ TransferError receive_file(net::UdpSocket& socket,
     }
 
     if (!timing_started) {
-      // Start the clock at the first packet, not at bind time, so the number
-      // measures the transfer rather than how long the server sat idle.
+      // Clock starts at the first packet, so the figure measures the transfer
+      // rather than how long the server sat waiting for a client.
       started = Clock::now();
       timing_started = true;
     }
 
-    ++stats.packets_received;
-
-    const auto result = proto::deserialize(
-        std::span<const std::byte>{buffer.data(),
-                                   static_cast<std::size_t>(received)});
+    const auto result = proto::deserialize(std::span<const std::byte>{
+        buffer.data(), static_cast<std::size_t>(received)});
     if (!result.ok()) {
-      continue;  // not ours, or corrupt: ignore it
+      continue;  // a UDP port accepts anything; ignore what we cannot parse
     }
 
     const proto::Packet& packet = result.value();
-    const proto::PacketHeader& header = packet.header;
+    const ReceiverSession::Reply reply = session.handle_packet(packet);
 
-    if (header.packet_type == proto::PacketType::kFin) {
-      if (!send_ack(socket, peer, header.session_id, header.sequence_number)) {
-        return TransferError::kSendFailed;
-      }
-      if (header.byte_offset != bytes_written) {
-        // The sender's declared total disagrees with what we actually wrote,
-        // so the file on disk is not the file that was sent.
-        return TransferError::kSizeMismatch;
-      }
-      break;
-    }
-
-    if (header.packet_type != proto::PacketType::kData) {
-      continue;  // milestone 2 speaks only DATA, ACK and FIN
-    }
-
-    if (header.sequence_number < expected) {
-      // Already written. pwrite would make rewriting it harmless, but there is
-      // no reason to touch the disk again -- just re-acknowledge.
-      ++stats.duplicates_received;
-      if (!send_ack(socket, peer, header.session_id, header.sequence_number)) {
-        return TransferError::kSendFailed;
-      }
-      continue;
-    }
-
-    if (header.sequence_number > expected) {
-      // Cannot happen with a single packet in flight over a non-reordering
-      // path, and there is nowhere to buffer it until milestone 3, so drop it
-      // without acknowledging. The sender will retransmit what we actually
-      // want once its timer fires.
-      ++stats.out_of_order_received;
-      continue;
-    }
-
-    const std::ptrdiff_t written =
-        file.write_at(packet.payload, header.byte_offset);
-    if (written < 0 ||
-        static_cast<std::size_t>(written) != packet.payload.size()) {
-      return TransferError::kFileWriteFailed;
-    }
-
-    bytes_written += packet.payload.size();
-    ++expected;
-    ++stats.chunks;
-    stats.bytes_transferred = bytes_written;
-
-    if (!send_ack(socket, peer, header.session_id, header.sequence_number)) {
+    if (reply.send &&
+        !send_reply(socket, peer, reply, packet.header.session_id)) {
       return TransferError::kSendFailed;
     }
   }
 
-  if (!file.sync()) {
-    return TransferError::kFileWriteFailed;
+  if (session.error() != TransferError::kNone) {
+    return session.error();
+  }
+  if (!session.finalize()) {
+    return session.error();
   }
 
+  stats = session.stats();
   stats.elapsed_seconds =
       std::chrono::duration<double>(Clock::now() - started).count();
   return TransferError::kNone;

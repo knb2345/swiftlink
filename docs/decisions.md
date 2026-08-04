@@ -98,3 +98,34 @@ Each benchmark run compares the received file's SHA-256 against the source and
 reports FAILED rather than a number if they differ. A throughput figure from a
 transfer that did not reproduce the file is worse than no figure. All three
 runs per condition are recorded individually so variance is visible.
+
+## 2026-08-04 — M3: retransmission timers in a heap with lazy deletion
+The brief asked for a timer structure that avoids scanning all outstanding
+packets each loop iteration. A per-packet deadline array costs O(W) per
+iteration and therefore O(N*W) per transfer -- the timer scan gets more
+expensive precisely as you raise W to go faster. Instead deadlines live in a
+binary min-heap: next deadline is O(1), schedule/expire are O(log W).
+A heap cannot delete from the middle, which ACKs require, so cancellation is
+lazy: each window slot carries a generation counter, each heap entry records
+the generation it was created with, and cancelling bumps the slot's generation.
+Entries whose generation no longer matches are discarded when they surface.
+
+## 2026-08-04 — Out-of-order data is written straight to disk, never buffered
+Each DATA packet carries its own byte_offset, so pwrite places it correctly
+whether or not its predecessors have arrived. The receiver window therefore
+stores one bit per sequence number (has it been written?) rather than holding
+payloads in memory. Memory used by a receiving session is independent of the
+window size, and the reordering buffer that a textbook Selective Repeat
+receiver needs does not exist here at all.
+
+## 2026-08-04 — Receiver window defaults much larger than the sender's
+The receiver window exists only to recognise duplicates; a sequence beyond
+base + capacity must be dropped because marking it would alias onto a live ring
+slot. Defaulting the receiver to 1024 against a sender default of 32 means a
+client configured with a larger window still interoperates, at a cost of one
+bit per slot. Negotiating this properly belongs with the M4 handshake.
+
+## 2026-08-04 — ReceiverSession is a state machine with no socket access
+handle_packet() takes a decoded packet and returns what to send back, doing no
+I/O. M3 drives it from a blocking loop and M5 drives it from epoll with many
+sessions at once, without the reliability logic changing at all.

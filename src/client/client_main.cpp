@@ -1,10 +1,11 @@
-// Milestone 2 client: send a file with stop-and-wait reliability.
+// SwiftLink client: send a file with Selective Repeat reliability.
 //
 //   swiftlink_client <host> <port> <file> [options]
 //     --simulate-loss=P   drop a fraction P of outbound datagrams (0.0 - 1.0)
 //     --seed=N            seed the loss generator so a run is reproducible
 //     --rto-ms=N          retransmission timeout (default 300)
 //     --chunk=N           payload bytes per packet (default 1200)
+//     --window=N          packets in flight (default 32; 1 = stop-and-wait)
 //     --quiet             print only the machine-readable STATS line
 
 #include <cerrno>
@@ -86,6 +87,15 @@ struct Options {
           return false;
         }
         options.sender.rto = std::chrono::milliseconds{static_cast<long>(ms)};
+      } else if (name == "--window") {
+        unsigned long long window = 0;
+        if (!parse_unsigned(value, window) || window == 0 ||
+            window > swiftlink::transfer::kDefaultReceiverWindowSize) {
+          std::cerr << "--window expects 1.."
+                    << swiftlink::transfer::kDefaultReceiverWindowSize << '\n';
+          return false;
+        }
+        options.sender.window_size = static_cast<std::uint32_t>(window);
       } else if (name == "--chunk") {
         unsigned long long size = 0;
         if (!parse_unsigned(value, size) || size == 0 ||
@@ -127,7 +137,7 @@ struct Options {
   if (positional < 3) {
     std::cerr << "usage: swiftlink_client <host> <port> <file> "
                  "[--simulate-loss=P] [--seed=N] [--rto-ms=N] [--chunk=N] "
-                 "[--quiet]\n";
+                 "[--window=N] [--quiet]\n";
     return false;
   }
   return true;
@@ -160,9 +170,10 @@ int main(int argc, char** argv) {
     std::cout << std::format("sending {} to {}:{}\n", options.path, options.host,
                              options.port);
     std::cout << std::format(
-        "  chunk={} rto={}ms simulate_loss={} seed={}\n",
-        options.sender.chunk_size, options.sender.rto.count(),
-        options.sender.loss_probability, options.sender.seed);
+        "  chunk={} window={} rto={}ms simulate_loss={} seed={}\n",
+        options.sender.chunk_size, options.sender.window_size,
+        options.sender.rto.count(), options.sender.loss_probability,
+        options.sender.seed);
   }
 
   xfer::TransferStats stats;
@@ -178,10 +189,11 @@ int main(int argc, char** argv) {
   std::cout << std::format(
       "STATS elapsed_s={:.4f} throughput_mbps={:.3f} bytes={} chunks={} "
       "packets_sent={} retransmissions={} simulated_drops={} timeouts={} "
-      "seed={}\n",
+      "window={} seed={}\n",
       stats.elapsed_seconds, stats.throughput_mbps(), stats.bytes_transferred,
       stats.chunks, stats.packets_sent, stats.retransmissions,
-      stats.simulated_drops, stats.timeouts, options.sender.seed);
+      stats.simulated_drops, stats.timeouts, options.sender.window_size,
+      options.sender.seed);
 
   return 0;
 }

@@ -1,4 +1,4 @@
-// Milestone 2 server: receive one file, write it, print statistics, exit.
+// SwiftLink server: receive one file, write it, print statistics, exit.
 //
 //   swiftlink_server <port> <output-file> [--idle-ms=N] [--quiet]
 //

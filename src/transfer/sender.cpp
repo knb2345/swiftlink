@@ -7,12 +7,12 @@
 
 #include "swiftlink/io/file.hpp"
 #include "swiftlink/protocol/packet.hpp"
+#include "swiftlink/transfer/window.hpp"
 
 namespace swiftlink::transfer {
 namespace {
 
 namespace proto = swiftlink::protocol;
-using Clock = std::chrono::steady_clock;
 
 // Decides whether an outbound datagram is "lost". Kept in one place so the
 // send path has a single branch and the counter cannot drift from reality.
@@ -51,102 +51,12 @@ class LossSimulator {
   return socket.send_to(wire, destination) >= 0;
 }
 
-// Waits for an ACK whose acknowledgement_number is `expected`, until `deadline`.
-//
-// Returns:
-//    1  the expected ACK arrived
-//    0  the deadline passed (caller should retransmit)
-//   -1  a socket error
-//
-// Anything else that arrives -- a stale ACK for an earlier chunk, a malformed
-// datagram, a packet from an unrelated sender -- is counted and ignored, and
-// the wait resumes with whatever time is left. Restarting the full timeout on
-// every stray packet would let a chatty third party postpone a retransmission
-// indefinitely.
-[[nodiscard]] int await_ack(net::UdpSocket& socket, std::uint32_t expected,
-                            Clock::time_point deadline, TransferStats& stats) {
-  std::vector<std::byte> buffer(proto::kHeaderWireSize + proto::kMaxPayloadSize);
-
-  for (;;) {
-    const auto remaining = deadline - Clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero()) {
-      ++stats.timeouts;
-      return 0;
-    }
-
-    if (!socket.set_receive_timeout(
-            std::chrono::duration_cast<std::chrono::microseconds>(remaining))) {
-      return -1;
-    }
-
-    net::Endpoint from;
-    const std::ptrdiff_t received = socket.recv_from(buffer, from);
-    if (received < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        ++stats.timeouts;
-        return 0;  // SO_RCVTIMEO fired: nothing arrived in time
-      }
-      if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-
-    ++stats.packets_received;
-
-    const auto result = proto::deserialize(
-        std::span<const std::byte>{buffer.data(),
-                                   static_cast<std::size_t>(received)});
-    if (!result.ok()) {
-      continue;  // garbage on the port; a UDP socket accepts anything
-    }
-
-    const proto::PacketHeader& header = result.value().header;
-    if (header.packet_type != proto::PacketType::kAck) {
-      continue;
-    }
-
-    if (header.acknowledgement_number == expected) {
-      return 1;
-    }
-
-    // A duplicate or stale ACK. Under stop-and-wait this happens when an ACK we
-    // already acted on was delayed rather than lost.
-    ++stats.duplicates_received;
-  }
-}
-
-// Sends one packet and blocks until it is acknowledged, retransmitting on each
-// timeout. This is the whole of stop-and-wait, and both DATA and FIN use it.
-[[nodiscard]] TransferError send_reliably(net::UdpSocket& socket,
-                                          const net::Endpoint& destination,
-                                          const std::vector<std::byte>& wire,
-                                          std::uint32_t sequence,
-                                          const SenderConfig& config,
-                                          LossSimulator& loss,
-                                          TransferStats& stats) {
-  for (int attempt = 0; attempt <= config.max_retries; ++attempt) {
-    if (attempt > 0) {
-      ++stats.retransmissions;
-    }
-
-    if (!send_packet(socket, destination, wire, loss, stats)) {
-      return TransferError::kSendFailed;
-    }
-
-    const Clock::time_point deadline = Clock::now() + config.rto;
-    const int outcome = await_ack(socket, sequence, deadline, stats);
-    if (outcome == 1) {
-      return TransferError::kNone;
-    }
-    if (outcome < 0) {
-      return TransferError::kReceiveFailed;
-    }
-    // outcome == 0: the RTO expired, so go round again and retransmit.
-  }
-
-  return TransferError::kPeerUnresponsive;
-}
+// One outstanding packet: the exact bytes to resend, plus how many times we
+// have already tried.
+struct InFlight {
+  std::vector<std::byte> wire;
+  int attempts = 0;
+};
 
 }  // namespace
 
@@ -164,65 +74,185 @@ TransferError send_file(net::UdpSocket& socket,
     return TransferError::kFileOpenFailed;
   }
 
-  LossSimulator loss(config.loss_probability, config.seed);
-  std::vector<std::byte> chunk(config.chunk_size);
-
-  const Clock::time_point started = Clock::now();
-
-  std::uint64_t offset = 0;
-  std::uint32_t sequence = 0;
-
-  while (offset < file_size) {
-    const std::uint64_t remaining = file_size - offset;
-    const std::size_t want = static_cast<std::size_t>(
-        remaining < config.chunk_size ? remaining : config.chunk_size);
-
-    const std::ptrdiff_t read = file.read_at(
-        std::span<std::byte>{chunk.data(), want}, offset);
-    if (read < 0 || static_cast<std::size_t>(read) != want) {
-      return TransferError::kFileReadFailed;
-    }
-
-    proto::PacketHeader header;
-    header.packet_type = proto::PacketType::kData;
-    header.session_id = config.session_id;
-    header.sequence_number = sequence;
-    header.byte_offset = offset;
-
-    const std::vector<std::byte> wire = proto::serialize(
-        header, std::span<const std::byte>{chunk.data(), want});
-
-    const TransferError error = send_reliably(socket, destination, wire,
-                                              sequence, config, loss, stats);
-    if (error != TransferError::kNone) {
-      return error;
-    }
-
-    offset += want;
-    ++sequence;
-    ++stats.chunks;
-    stats.bytes_transferred = offset;
+  const std::uint64_t total_chunks =
+      (file_size + config.chunk_size - 1) / config.chunk_size;
+  if (total_chunks > 0xFFFFFFFFULL) {
+    // sequence_number is 32 bits; a file needing more chunks than that cannot
+    // be addressed by this protocol version.
+    return TransferError::kProtocolViolation;
   }
 
-  // FIN carries the total size in byte_offset so the receiver can confirm it
-  // has every byte, and takes the sequence number one past the last chunk so
-  // the same ACK-matching logic works unchanged.
+  LossSimulator loss(config.loss_probability, config.seed);
+  SenderWindow window(config.window_size);
+  std::vector<InFlight> in_flight(window.capacity());
+  std::vector<std::byte> chunk(config.chunk_size);
+  std::vector<std::byte> receive_buffer(proto::kHeaderWireSize +
+                                        proto::kMaxPayloadSize);
+
+  const TimePoint started = Clock::now();
+
+  // ------------------------------------------------------------------
+  // Main loop: keep the window full, then wait for either an ACK or the
+  // earliest retransmission deadline, whichever comes first.
+  // ------------------------------------------------------------------
+  while (window.base() < total_chunks) {
+    // 1. Fill the window. This is the entire difference from stop-and-wait:
+    //    up to `capacity` packets are in flight instead of one, so the link
+    //    carries `capacity` chunks per RTT rather than one.
+    while (window.can_send() && window.next_sequence() < total_chunks) {
+      const std::uint32_t sequence = window.next_sequence();
+      const std::uint64_t offset =
+          static_cast<std::uint64_t>(sequence) * config.chunk_size;
+      const std::uint64_t remaining = file_size - offset;
+      const std::size_t want = static_cast<std::size_t>(
+          remaining < config.chunk_size ? remaining : config.chunk_size);
+
+      const std::ptrdiff_t read =
+          file.read_at(std::span<std::byte>{chunk.data(), want}, offset);
+      if (read < 0 || static_cast<std::size_t>(read) != want) {
+        return TransferError::kFileReadFailed;
+      }
+
+      proto::PacketHeader header;
+      header.packet_type = proto::PacketType::kData;
+      header.session_id = config.session_id;
+      header.sequence_number = sequence;
+      header.byte_offset = offset;
+
+      InFlight& slot = in_flight[sequence % window.capacity()];
+      slot.wire = proto::serialize(
+          header, std::span<const std::byte>{chunk.data(), want});
+      slot.attempts = 1;
+
+      if (!send_packet(socket, destination, slot.wire, loss, stats)) {
+        return TransferError::kSendFailed;
+      }
+      window.on_sent(Clock::now() + config.rto);
+    }
+
+    // 2. Sleep until the earliest deadline, or until an ACK wakes us.
+    const std::optional<TimePoint> deadline = window.earliest_deadline();
+    if (!deadline.has_value()) {
+      break;  // nothing outstanding and nothing left to send
+    }
+
+    auto wait = *deadline - Clock::now();
+    if (wait < Clock::duration::zero()) {
+      wait = Clock::duration::zero();
+    }
+    if (!socket.set_receive_timeout(
+            std::chrono::duration_cast<std::chrono::microseconds>(wait))) {
+      return TransferError::kSocketFailed;
+    }
+
+    net::Endpoint from;
+    const std::ptrdiff_t received = socket.recv_from(receive_buffer, from);
+    if (received >= 0) {
+      ++stats.packets_received;
+      const auto result = proto::deserialize(std::span<const std::byte>{
+          receive_buffer.data(), static_cast<std::size_t>(received)});
+      if (result.ok() &&
+          result.value().header.packet_type == proto::PacketType::kAck) {
+        const std::uint32_t acked =
+            result.value().header.acknowledgement_number;
+        if (!window.on_ack(acked)) {
+          // Duplicate or out-of-window ACK. Harmless, but counted: a burst of
+          // them is the signature of ACKs being retransmitted needlessly.
+          ++stats.duplicates_received;
+        }
+      }
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      return TransferError::kReceiveFailed;
+    }
+
+    // 3. Retransmit whatever has timed out. Only the packets whose individual
+    //    timers fired are resent -- that is what makes this Selective Repeat
+    //    rather than Go-Back-N, which would resend the whole window.
+    const TimePoint now = Clock::now();
+    for (const std::uint32_t sequence : window.expire(now)) {
+      InFlight& slot = in_flight[sequence % window.capacity()];
+      if (slot.attempts >= config.max_retries) {
+        return TransferError::kPeerUnresponsive;
+      }
+      ++slot.attempts;
+      ++stats.retransmissions;
+      ++stats.timeouts;
+
+      if (!send_packet(socket, destination, slot.wire, loss, stats)) {
+        return TransferError::kSendFailed;
+      }
+      window.reschedule(sequence, Clock::now() + config.rto);
+    }
+  }
+
+  stats.chunks = total_chunks;
+  stats.bytes_transferred = file_size;
+
+  // ------------------------------------------------------------------
+  // FIN, sent stop-and-wait: there is exactly one packet, so a window would
+  // buy nothing.
+  // ------------------------------------------------------------------
   proto::PacketHeader fin;
   fin.packet_type = proto::PacketType::kFin;
   fin.session_id = config.session_id;
-  fin.sequence_number = sequence;
+  fin.sequence_number = static_cast<std::uint32_t>(total_chunks);
   fin.byte_offset = file_size;
 
   const std::vector<std::byte> fin_wire = proto::serialize(fin, {});
-  const TransferError error =
-      send_reliably(socket, destination, fin_wire, sequence, config, loss, stats);
-  if (error != TransferError::kNone) {
-    return error;
+
+  for (int attempt = 0; attempt <= config.max_retries; ++attempt) {
+    if (attempt > 0) {
+      ++stats.retransmissions;
+    }
+    if (!send_packet(socket, destination, fin_wire, loss, stats)) {
+      return TransferError::kSendFailed;
+    }
+
+    const TimePoint deadline = Clock::now() + config.rto;
+    bool acknowledged = false;
+
+    while (!acknowledged) {
+      auto wait = deadline - Clock::now();
+      if (wait <= Clock::duration::zero()) {
+        ++stats.timeouts;
+        break;
+      }
+      if (!socket.set_receive_timeout(
+              std::chrono::duration_cast<std::chrono::microseconds>(wait))) {
+        return TransferError::kSocketFailed;
+      }
+
+      net::Endpoint from;
+      const std::ptrdiff_t received = socket.recv_from(receive_buffer, from);
+      if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          ++stats.timeouts;
+          break;
+        }
+        if (errno == EINTR) {
+          continue;
+        }
+        return TransferError::kReceiveFailed;
+      }
+
+      ++stats.packets_received;
+      const auto result = proto::deserialize(std::span<const std::byte>{
+          receive_buffer.data(), static_cast<std::size_t>(received)});
+      if (result.ok() &&
+          result.value().header.packet_type == proto::PacketType::kAck &&
+          result.value().header.acknowledgement_number == fin.sequence_number) {
+        acknowledged = true;
+      }
+    }
+
+    if (acknowledged) {
+      stats.elapsed_seconds =
+          std::chrono::duration<double>(Clock::now() - started).count();
+      return TransferError::kNone;
+    }
   }
 
-  stats.elapsed_seconds =
-      std::chrono::duration<double>(Clock::now() - started).count();
-  return TransferError::kNone;
+  return TransferError::kPeerUnresponsive;
 }
 
 }  // namespace swiftlink::transfer

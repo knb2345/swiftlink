@@ -29,6 +29,18 @@ inline constexpr std::chrono::milliseconds kDefaultRto{300};
 // the transfer instead of hanging forever.
 inline constexpr int kMaxRetriesPerChunk = 50;
 
+// Packets the sender may have outstanding at once. 32 x 1200 bytes = 38.4 KB
+// in flight, which fills a 12 Mbps path at a 25 ms RTT.
+inline constexpr std::uint32_t kDefaultWindowSize = 32;
+
+// The receiver's window is deliberately much larger than the sender's default.
+// Its only job is to recognise duplicates, and a sequence number beyond
+// base + capacity has to be discarded because marking it would alias onto a
+// live slot in the ring. Sizing it generously means a client configured with a
+// larger window than the server still interoperates, at a cost of one bit per
+// slot. The sender's window must not exceed this.
+inline constexpr std::uint32_t kDefaultReceiverWindowSize = 1024;
+
 enum class TransferError : std::uint8_t {
   kNone = 0,
   kFileOpenFailed,

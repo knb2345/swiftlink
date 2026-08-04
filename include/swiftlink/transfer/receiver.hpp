@@ -18,6 +18,9 @@ namespace swiftlink::transfer {
 struct ReceiverConfig {
   // How long to wait for the next packet before concluding the peer is gone.
   std::chrono::milliseconds idle_timeout{10000};
+
+  // Duplicate-detection window. Must be at least as large as the sender's.
+  std::uint32_t window_size = kDefaultReceiverWindowSize;
 };
 
 // Receives one file into `output_path`. `socket` must already be bound.

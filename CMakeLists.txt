@@ -62,7 +62,9 @@ target_link_libraries(swiftlink_io PRIVATE swiftlink_warnings)
 # ---------------------------------------------------------------------------
 add_library(swiftlink_transfer STATIC
   src/transfer/transfer.cpp
+  src/transfer/window.cpp
   src/transfer/sender.cpp
+  src/transfer/receiver_session.cpp
   src/transfer/receiver.cpp)
 
 target_include_directories(swiftlink_transfer PUBLIC

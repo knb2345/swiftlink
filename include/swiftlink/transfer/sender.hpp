@@ -22,6 +22,11 @@ struct SenderConfig {
   std::chrono::milliseconds rto = kDefaultRto;
   int max_retries = kMaxRetriesPerChunk;
 
+  // Packets outstanding at once. 1 reproduces milestone 2's stop-and-wait
+  // behaviour exactly, which is what makes the benchmark comparison honest:
+  // the same code path is measured at every window size.
+  std::uint32_t window_size = kDefaultWindowSize;
+
   // Probability in [0, 1] that an outbound datagram is thrown away instead of
   // being handed to sendto. This models packet loss on the forward path
   // without needing a lossy network: the sender's state machine cannot tell
