@@ -26,6 +26,8 @@ target_compile_options(swiftlink_warnings INTERFACE
 # ---------------------------------------------------------------------------
 add_library(swiftlink_protocol STATIC
   src/protocol/packet.cpp
+  src/protocol/crc32.cpp
+  src/protocol/status.cpp
   src/protocol/serializer.cpp)
 
 target_include_directories(swiftlink_protocol PUBLIC
@@ -46,6 +48,17 @@ target_include_directories(swiftlink_net PUBLIC
 target_link_libraries(swiftlink_net PRIVATE swiftlink_warnings)
 
 # ---------------------------------------------------------------------------
+# Crypto: SHA-256 from scratch, for end-to-end file verification.
+# ---------------------------------------------------------------------------
+add_library(swiftlink_crypto STATIC
+  src/crypto/sha256.cpp)
+
+target_include_directories(swiftlink_crypto PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+target_link_libraries(swiftlink_crypto PRIVATE swiftlink_warnings)
+
+# ---------------------------------------------------------------------------
 # IO: RAII file descriptor with positional (pread/pwrite) access.
 # ---------------------------------------------------------------------------
 add_library(swiftlink_io STATIC
@@ -62,6 +75,7 @@ target_link_libraries(swiftlink_io PRIVATE swiftlink_warnings)
 # ---------------------------------------------------------------------------
 add_library(swiftlink_transfer STATIC
   src/transfer/transfer.cpp
+  src/transfer/filename.cpp
   src/transfer/window.cpp
   src/transfer/sender.cpp
   src/transfer/receiver_session.cpp
@@ -71,7 +85,7 @@ target_include_directories(swiftlink_transfer PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_link_libraries(swiftlink_transfer
-  PUBLIC swiftlink_protocol swiftlink_net swiftlink_io
+  PUBLIC swiftlink_protocol swiftlink_net swiftlink_io swiftlink_crypto
   PRIVATE swiftlink_warnings)
 
 # ---------------------------------------------------------------------------
@@ -104,3 +118,9 @@ add_test(NAME protocol_tests COMMAND protocol_tests)
 # ---------------------------------------------------------------------------
 add_executable(delay_proxy tools/delay_proxy.cpp)
 target_link_libraries(delay_proxy PRIVATE swiftlink_warnings)
+
+add_executable(crypto_tests tests/crypto_tests.cpp)
+target_link_libraries(crypto_tests
+  PRIVATE swiftlink_crypto swiftlink_protocol swiftlink_transfer swiftlink_warnings)
+
+add_test(NAME crypto_tests COMMAND crypto_tests)

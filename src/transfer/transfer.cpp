@@ -24,6 +24,14 @@ std::string_view to_string(TransferError error) noexcept {
       return "peer violated the protocol";
     case TransferError::kSizeMismatch:
       return "received byte count disagrees with the declared file size";
+    case TransferError::kHandshakeFailed:
+      return "no START_ACK from the peer";
+    case TransferError::kRemoteError:
+      return "peer reported an error";
+    case TransferError::kIntegrityFailed:
+      return "SHA-256 verification failed";
+    case TransferError::kInvalidFilename:
+      return "filename rejected by the receiver";
   }
   return "unknown transfer error";
 }

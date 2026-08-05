@@ -82,7 +82,7 @@ struct PacketHeader {
   std::uint64_t byte_offset = 0;
   std::uint16_t payload_length = 0;
   std::uint16_t flags = 0;
-  std::uint32_t checksum = 0;  // always 0 in milestone 1; CRC32 arrives later
+  std::uint32_t checksum = 0;  // CRC32; computed by serialize(), never by hand
 };
 #pragma pack(pop)
 
@@ -111,6 +111,7 @@ enum class DecodeError : std::uint8_t {
   kBadHeaderLength,         // header_length disagrees with kHeaderWireSize
   kUnknownPacketType,       // packet_type is not in the PacketType enum
   kPayloadLengthMismatch,   // declared payload size != bytes actually present
+  kChecksumMismatch,        // CRC32 says the packet was corrupted in transit
 };
 
 [[nodiscard]] std::string_view to_string(DecodeError error) noexcept;
@@ -157,6 +158,10 @@ class DecodeResult {
 
 // Produces kHeaderWireSize + payload.size() bytes: header fields written
 // big-endian in the documented order, then the payload verbatim.
+//
+// `header.checksum` is ignored and recomputed: the CRC is taken over the whole
+// finished packet with the checksum field itself zeroed, so a caller cannot
+// accidentally ship a stale or hand-written value.
 //
 // `header.payload_length` is ignored and recomputed from payload.size(), so the
 // two can never disagree on the wire. A payload longer than kMaxPayloadSize

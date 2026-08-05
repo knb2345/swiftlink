@@ -28,19 +28,17 @@ namespace proto = swiftlink::protocol;
   header.sequence_number = reply.sequence;
   header.acknowledgement_number = reply.sequence;
 
-  const std::vector<std::byte> wire = proto::serialize(header, {});
+  const std::vector<std::byte> wire = proto::serialize(header, reply.payload);
   return socket.send_to(wire, peer) >= 0;
 }
 
 }  // namespace
 
 TransferError receive_file(net::UdpSocket& socket,
-                           const std::string& output_path,
-                           const ReceiverConfig& config, TransferStats& stats) {
-  ReceiverSession session(config.window_size);
-  if (!session.open(output_path)) {
-    return session.error();
-  }
+                           const std::string& output_directory,
+                           const ReceiverConfig& config, TransferStats& stats,
+                           std::string& out_path) {
+  ReceiverSession session(config.window_size, output_directory);
 
   if (!socket.set_receive_timeout(
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -88,16 +86,16 @@ TransferError receive_file(net::UdpSocket& socket,
     }
   }
 
-  if (session.error() != TransferError::kNone) {
-    return session.error();
-  }
-  if (!session.finalize()) {
-    return session.error();
-  }
+  out_path = session.output_path();
 
   stats = session.stats();
   stats.elapsed_seconds =
       std::chrono::duration<double>(Clock::now() - started).count();
+
+  if (session.error() != TransferError::kNone) {
+    return session.error();
+  }
+
   return TransferError::kNone;
 }
 

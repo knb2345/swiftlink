@@ -54,6 +54,8 @@ std::string_view to_string(DecodeError error) noexcept {
       return "unknown packet type";
     case DecodeError::kPayloadLengthMismatch:
       return "declared payload_length disagrees with the bytes received";
+    case DecodeError::kChecksumMismatch:
+      return "CRC32 mismatch (packet corrupted in transit)";
   }
   return "unknown error";
 }

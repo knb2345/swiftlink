@@ -6,6 +6,7 @@
 //     --rto-ms=N          retransmission timeout (default 300)
 //     --chunk=N           payload bytes per packet (default 1200)
 //     --window=N          packets in flight (default 32; 1 = stop-and-wait)
+//     --name=NAME         filename to advertise (default: basename of <file>)
 //     --quiet             print only the machine-readable STATS line
 
 #include <cerrno>
@@ -20,6 +21,7 @@
 
 #include "swiftlink/net/udp_socket.hpp"
 #include "swiftlink/protocol/packet.hpp"
+#include "swiftlink/protocol/status.hpp"
 #include "swiftlink/transfer/sender.hpp"
 #include "swiftlink/transfer/transfer.hpp"
 
@@ -96,6 +98,8 @@ struct Options {
           return false;
         }
         options.sender.window_size = static_cast<std::uint32_t>(window);
+      } else if (name == "--name") {
+        options.sender.remote_name = std::string(value);
       } else if (name == "--chunk") {
         unsigned long long size = 0;
         if (!parse_unsigned(value, size) || size == 0 ||
@@ -156,7 +160,23 @@ int main(int argc, char** argv) {
   if (options.sender.seed == 0) {
     options.sender.seed = std::random_device{}();
   }
-  options.sender.session_id = 0x0123456789ABCDEFULL;
+  // A fresh random session id per transfer. The receiver requires every DATA
+  // and FIN packet to carry it, so a stale datagram from a previous transfer
+  // to the same port cannot be mistaken for part of this one.
+  if (options.sender.session_id == 0) {
+    std::mt19937_64 rng(std::random_device{}());
+    do {
+      options.sender.session_id = rng();
+    } while (options.sender.session_id == 0);
+  }
+
+  // Advertise only the basename; the receiver sanitises it again regardless.
+  if (options.sender.remote_name.empty()) {
+    const std::size_t slash = options.path.find_last_of('/');
+    options.sender.remote_name = (slash == std::string::npos)
+                                     ? options.path
+                                     : options.path.substr(slash + 1);
+  }
 
   swiftlink::net::UdpSocket socket;
   if (!socket.open()) {
@@ -181,7 +201,13 @@ int main(int argc, char** argv) {
       socket, destination, options.path, options.sender, stats);
 
   if (error != xfer::TransferError::kNone) {
-    std::cerr << std::format("transfer failed: {}\n", xfer::to_string(error));
+    if (error == xfer::TransferError::kRemoteError) {
+      std::cerr << std::format(
+          "transfer failed: peer reported: {}\n",
+          swiftlink::protocol::to_string(stats.remote_status));
+    } else {
+      std::cerr << std::format("transfer failed: {}\n", xfer::to_string(error));
+    }
     return 1;
   }
 

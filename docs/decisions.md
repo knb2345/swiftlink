@@ -129,3 +129,43 @@ bit per slot. Negotiating this properly belongs with the M4 handshake.
 handle_packet() takes a decoded packet and returns what to send back, doing no
 I/O. M3 drives it from a blocking loop and M5 drives it from epoll with many
 sessions at once, without the reliability logic changing at all.
+
+## 2026-08-05 — M4: CRC32 covers the packet, SHA-256 covers the file
+Two checks at two layers, answering different questions. CRC32 is per packet,
+computed over header and payload with the checksum field zeroed, and catches a
+datagram corrupted in transit. It is explicitly not a security control: CRC32
+is linear, so anyone able to modify a packet can also repair its checksum.
+SHA-256 over the whole file in the FIN packet is the end-to-end check, and it
+catches everything the per-packet CRC structurally cannot -- a chunk written to
+the wrong offset, a reassembly bug of ours, a duplicate that overwrote good
+data. UDP's own checksum is not sufficient for either job: 16 bits, and
+optional in IPv4.
+
+## 2026-08-05 — The receiver hashes by reading the file back, not streaming
+Chunks can arrive out of order and SHA-256 is inherently sequential, so the
+digest cannot be computed as packets arrive. Reading the finished file back
+costs one extra pass over the data but produces a strictly stronger guarantee:
+it verifies the bytes that actually landed on disk rather than the bytes that
+went past on the wire. This is also why File::open_write uses O_RDWR rather
+than O_WRONLY -- found the hard way, when the first end-to-end M4 run failed
+with EBADF inside the verification pass.
+
+## 2026-08-05 — Filename sanitisation is an allowlist, and rejects rather than cleans
+Denylisting traversal patterns is a game the attacker wins ("....//" survives
+naive ".." removal). Instead the name is reduced to its final path component
+*once*, then required to match a narrow character set; anything else is
+refused. Refusing rather than rewriting matters because a silently "cleaned"
+name means the file that lands is not the file that was requested. Rejecting
+non-ASCII is stricter than POSIX requires and would need relaxing for
+international filenames -- noted in docs/todo.md.
+
+## 2026-08-05 — Session ids are random per transfer and checked on every packet
+The receiver requires every DATA and FIN packet to carry the id agreed during
+the handshake. Without it, a delayed datagram from an earlier transfer to the
+same port could inject bytes into the current file. A random 64-bit id also
+means an off-path attacker must guess it to interfere.
+
+## 2026-08-05 — A retransmitted START is re-acknowledged, never re-opened
+If our START_ACK is lost the client resends START. Re-running the open path
+would apply O_TRUNC and discard everything received so far, so a duplicate
+START with a matching session id is simply acknowledged again.

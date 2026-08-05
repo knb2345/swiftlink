@@ -38,6 +38,11 @@ struct SenderConfig {
   std::uint64_t seed = 0;
 
   std::uint64_t session_id = 0;
+
+  // Name advertised to the receiver in the START packet. The receiver
+  // sanitises it before use; sending a path here simply means the receiver
+  // keeps the last component.
+  std::string remote_name;
 };
 
 // Sends `path` to `destination` over `socket`. The socket must already be

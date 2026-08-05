@@ -30,7 +30,10 @@ bool File::open_read(const std::string& path) noexcept {
 
 bool File::open_write(const std::string& path) noexcept {
   close();
-  fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  // O_RDWR, not O_WRONLY: the receiver reads the finished file back to compute
+  // its SHA-256 for the end-to-end integrity check, and a write-only
+  // descriptor makes pread fail with EBADF.
+  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
   return fd_ >= 0;
 }
 

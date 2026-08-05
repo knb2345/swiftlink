@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include "swiftlink/protocol/crc32.hpp"
 #include "swiftlink/protocol/packet.hpp"
 
 namespace proto = swiftlink::protocol;
@@ -112,7 +113,9 @@ void test_round_trip_preserves_all_fields() {
   CHECK_EQ(got.byte_offset, sent.byte_offset);
   CHECK_EQ(got.payload_length, static_cast<std::uint16_t>(payload.size()));
   CHECK_EQ(got.flags, sent.flags);
-  CHECK_EQ(got.checksum, sent.checksum);
+  // Not compared against sent.checksum: serialize() computes the CRC itself
+  // and ignores whatever the caller put in the field. What matters is that the
+  // decoder accepted it, which it did, since ok() was true.
 
   CHECK(result.value().payload == payload);
 }
@@ -218,9 +221,14 @@ void test_wire_layout_is_big_endian() {
   CHECK_EQ(at(34), 0xBEU);
   CHECK_EQ(at(35), 0xEFU);
 
-  // checksum 0
-  CHECK_EQ(at(36), 0x00U);
-  CHECK_EQ(at(39), 0x00U);
+  // checksum: a real CRC32 now, so it is verified by recomputation rather than
+  // by asserting a constant. Reading it back big-endian must reproduce exactly
+  // what crc32_excluding_checksum computes over the same bytes.
+  const std::uint32_t on_wire = (static_cast<std::uint32_t>(at(36)) << 24) |
+                                (static_cast<std::uint32_t>(at(37)) << 16) |
+                                (static_cast<std::uint32_t>(at(38)) << 8) |
+                                static_cast<std::uint32_t>(at(39));
+  CHECK_EQ(on_wire, proto::crc32_excluding_checksum(wire, 36));
 
   // Payload starts immediately after the header, unmodified.
   CHECK_EQ(at(40), static_cast<unsigned>('x'));

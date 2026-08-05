@@ -23,10 +23,13 @@ struct ReceiverConfig {
   std::uint32_t window_size = kDefaultReceiverWindowSize;
 };
 
-// Receives one file into `output_path`. `socket` must already be bound.
+// Receives one file into `output_directory`. `socket` must already be bound.
+// The filename comes from the peer's START packet and is sanitised before use;
+// the path actually written is reported in `out_path`.
 [[nodiscard]] TransferError receive_file(net::UdpSocket& socket,
-                                         const std::string& output_path,
+                                         const std::string& output_directory,
                                          const ReceiverConfig& config,
-                                         TransferStats& stats);
+                                         TransferStats& stats,
+                                         std::string& out_path);
 
 }  // namespace swiftlink::transfer

@@ -47,6 +47,7 @@
 #include <cstring>
 #include <utility>
 
+#include "swiftlink/protocol/crc32.hpp"
 #include "swiftlink/protocol/packet.hpp"
 
 namespace swiftlink::protocol {
@@ -165,13 +166,22 @@ std::vector<std::byte> serialize(const PacketHeader& header,
              static_cast<std::uint16_t>(payload.size()));
 
   write_be16(out + offset::kFlags, header.flags);
-  write_be32(out + offset::kChecksum, header.checksum);
+
+  // The checksum field must be zero while the CRC is computed, because it
+  // cannot cover itself. It already is -- the buffer was value-initialised --
+  // but this states the requirement rather than relying on it.
+  write_be32(out + offset::kChecksum, 0);
 
   if (!payload.empty()) {
     // memcpy is fine here: this is an opaque byte sequence, not a struct. No
     // layout, alignment, or endianness question exists for a run of bytes.
     std::memcpy(out + kHeaderWireSize, payload.data(), payload.size());
   }
+
+  // Computed last, over header *and* payload, so corruption anywhere in the
+  // datagram is detected.
+  write_be32(out + offset::kChecksum,
+             crc32_excluding_checksum(buffer, offset::kChecksum));
 
   return buffer;
 }
@@ -227,6 +237,12 @@ DecodeResult deserialize(std::span<const std::byte> buffer) {
   const std::size_t actual_payload = buffer.size() - kHeaderWireSize;
   if (actual_payload != header.payload_length) {
     return DecodeResult::failure(DecodeError::kPayloadLengthMismatch);
+  }
+
+  // Checked only once the length is known to be consistent, so the CRC is
+  // computed over exactly the bytes the sender covered -- no more, no less.
+  if (crc32_excluding_checksum(buffer, offset::kChecksum) != header.checksum) {
+    return DecodeResult::failure(DecodeError::kChecksumMismatch);
   }
 
   Packet packet;

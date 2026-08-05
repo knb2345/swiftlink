@@ -33,7 +33,8 @@ class File {
   // O_RDONLY. Returns false with errno set.
   [[nodiscard]] bool open_read(const std::string& path) noexcept;
 
-  // O_WRONLY | O_CREAT | O_TRUNC, mode 0644.
+  // O_RDWR | O_CREAT | O_TRUNC, mode 0644. Read access is required because
+  // the receiver hashes the completed file by reading it back.
   [[nodiscard]] bool open_write(const std::string& path) noexcept;
 
   void close() noexcept;

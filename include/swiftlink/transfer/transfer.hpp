@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <string_view>
 
+#include "swiftlink/protocol/status.hpp"
+
 namespace swiftlink::transfer {
 
 // 1200 bytes of payload, so a full packet is 1240 bytes on the wire (40-byte
@@ -52,6 +54,10 @@ enum class TransferError : std::uint8_t {
   kPeerUnresponsive,   // exceeded kMaxRetriesPerChunk
   kProtocolViolation,  // peer sent something the state machine cannot accept
   kSizeMismatch,       // bytes received disagree with what the sender declared
+  kHandshakeFailed,    // no START_ACK before the retry budget ran out
+  kRemoteError,        // peer sent an ERROR packet; see TransferStats::remote_status
+  kIntegrityFailed,    // SHA-256 of the received file did not match
+  kInvalidFilename,    // the advertised name failed sanitisation
 };
 
 [[nodiscard]] std::string_view to_string(TransferError error) noexcept;
@@ -75,6 +81,10 @@ struct TransferStats {
   std::uint64_t timeouts = 0;
 
   double elapsed_seconds = 0.0;
+
+  // Set when the peer replied with an ERROR packet, so the caller can report
+  // *why* the far end gave up rather than just that it did.
+  protocol::StatusCode remote_status = protocol::StatusCode::kOk;
 
   // Megabits per second, decimal (10^6), which is the convention for network
   // throughput. Not mebibits.

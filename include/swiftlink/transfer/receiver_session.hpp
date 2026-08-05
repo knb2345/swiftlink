@@ -9,9 +9,11 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "swiftlink/io/file.hpp"
 #include "swiftlink/protocol/packet.hpp"
+#include "swiftlink/protocol/status.hpp"
 #include "swiftlink/transfer/transfer.hpp"
 #include "swiftlink/transfer/window.hpp"
 
@@ -24,27 +26,45 @@ class ReceiverSession {
     bool send = false;
     protocol::PacketType type = protocol::PacketType::kAck;
     std::uint32_t sequence = 0;
+    std::vector<std::byte> payload;  // ERROR packets carry a status + message
   };
 
-  explicit ReceiverSession(std::uint32_t window_capacity);
-
-  // Opens the output file. Must succeed before handle_packet is called.
-  [[nodiscard]] bool open(const std::string& output_path);
+  // `output_directory` is the only place this session may write. Filenames
+  // from the peer are sanitised to a bare name and joined to it, so a session
+  // cannot be talked into writing outside it.
+  ReceiverSession(std::uint32_t window_capacity, std::string output_directory);
 
   [[nodiscard]] Reply handle_packet(const protocol::Packet& packet);
 
+  [[nodiscard]] bool started() const noexcept { return started_; }
   [[nodiscard]] bool finished() const noexcept { return finished_; }
   [[nodiscard]] TransferError error() const noexcept { return error_; }
+  [[nodiscard]] std::uint64_t session_id() const noexcept { return session_id_; }
+  [[nodiscard]] const std::string& output_path() const noexcept {
+    return output_path_;
+  }
   [[nodiscard]] const TransferStats& stats() const noexcept { return stats_; }
   [[nodiscard]] TransferStats& stats() noexcept { return stats_; }
 
-  // Flushes to disk. Called once the transfer is finished.
-  [[nodiscard]] bool finalize();
-
  private:
+  [[nodiscard]] Reply on_start(const protocol::Packet& packet);
+  [[nodiscard]] Reply on_data(const protocol::Packet& packet);
+  [[nodiscard]] Reply on_fin(const protocol::Packet& packet);
+
+  // Builds an ERROR reply and marks the session failed.
+  [[nodiscard]] Reply fail(protocol::StatusCode code, TransferError error,
+                           std::uint32_t sequence);
+
   io::File file_;
   ReceiverWindow window_;
+  std::string output_directory_;
+  std::string output_path_;
+
+  std::uint64_t session_id_ = 0;
+  std::uint64_t declared_size_ = 0;
   std::uint64_t bytes_written_ = 0;
+
+  bool started_ = false;
   bool finished_ = false;
   TransferError error_ = TransferError::kNone;
   TransferStats stats_;

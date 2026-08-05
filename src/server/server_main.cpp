@@ -1,6 +1,9 @@
 // SwiftLink server: receive one file, write it, print statistics, exit.
 //
-//   swiftlink_server <port> <output-file> [--idle-ms=N] [--quiet]
+//   swiftlink_server <port> <output-dir> [--idle-ms=N] [--quiet]
+//
+// The filename comes from the client's START packet and is sanitised to a bare
+// name before being joined to <output-dir>, so a client cannot write outside it.
 //
 // One transfer per process, sequentially. Concurrency arrives in milestone 5
 // with epoll; until then the point is the reliability logic, not the plumbing.
@@ -13,6 +16,8 @@
 #include <string>
 #include <string_view>
 
+#include <sys/stat.h>
+
 #include "swiftlink/net/udp_socket.hpp"
 #include "swiftlink/transfer/receiver.hpp"
 #include "swiftlink/transfer/transfer.hpp"
@@ -23,7 +28,7 @@ namespace xfer = swiftlink::transfer;
 
 struct Options {
   std::uint16_t port = 9000;
-  std::string output_path;
+  std::string output_directory;
   xfer::ReceiverConfig receiver;
   bool quiet = false;
 };
@@ -75,7 +80,7 @@ struct Options {
         break;
       }
       case 1:
-        options.output_path = arg;
+        options.output_directory = arg;
         break;
       default:
         std::cerr << "unexpected argument: " << arg << '\n';
@@ -84,7 +89,7 @@ struct Options {
   }
 
   if (positional < 2) {
-    std::cerr << "usage: swiftlink_server <port> <output-file> "
+    std::cerr << "usage: swiftlink_server <port> <output-dir> "
                  "[--idle-ms=N] [--quiet]\n";
     return false;
   }
@@ -99,6 +104,13 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // Create the output directory if it does not exist. EEXIST is fine.
+  if (::mkdir(options.output_directory.c_str(), 0755) != 0 && errno != EEXIST) {
+    std::cerr << std::format("mkdir({}) failed: {}\n", options.output_directory,
+                             std::strerror(errno));
+    return 1;
+  }
+
   swiftlink::net::UdpSocket socket;
   if (!socket.open()) {
     std::cerr << std::format("socket() failed: {}\n", std::strerror(errno));
@@ -111,20 +123,25 @@ int main(int argc, char** argv) {
   }
 
   if (!options.quiet) {
-    std::cout << std::format("swiftlink server on 0.0.0.0:{} -> {}\n",
-                             options.port, options.output_path);
+    std::cout << std::format("swiftlink server on 0.0.0.0:{} -> {}/\n",
+                             options.port, options.output_directory);
   }
   // Unbuffered, so a benchmark script can wait for this line before starting
   // the client and know the socket is genuinely bound.
   std::cout << "READY" << std::endl;
 
   xfer::TransferStats stats;
+  std::string written_path;
   const xfer::TransferError error = xfer::receive_file(
-      socket, options.output_path, options.receiver, stats);
+      socket, options.output_directory, options.receiver, stats, written_path);
 
   if (error != xfer::TransferError::kNone) {
     std::cerr << std::format("receive failed: {}\n", xfer::to_string(error));
     return 1;
+  }
+
+  if (!options.quiet) {
+    std::cout << std::format("wrote {}\n", written_path);
   }
 
   std::cout << std::format(
