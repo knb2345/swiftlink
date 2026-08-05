@@ -18,9 +18,20 @@
 // Allowlist, not denylist. Rather than trying to enumerate dangerous inputs --
 // a game the attacker wins, because encoding tricks are endless -- the name is
 // reduced to its final path component and then required to match a narrow set
-// of permitted characters. Anything that does not fit is rejected outright
-// rather than "cleaned", because silently rewriting a name means the file that
-// lands is not the file that was asked for.
+// of permitted characters.
+//
+// Two different treatments, deliberately:
+//
+//   * Directory components are STRIPPED. "../../etc/passwd" becomes "passwd"
+//     and is accepted. This matches what scp and `unzip -j` do, and it is what
+//     makes the result structurally incapable of escaping the output
+//     directory. The stripping happens exactly once, and the result is then
+//     required to contain no separator at all -- repeatedly stripping is what
+//     lets "....//" style inputs through.
+//
+//   * Disallowed characters are REJECTED, not substituted. Silently rewriting
+//     a name means the file that lands is not the file that was asked for, and
+//     a caller cannot tell the difference.
 
 #pragma once
 

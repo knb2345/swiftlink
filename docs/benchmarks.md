@@ -187,4 +187,164 @@ as printed.)
 
 ## Milestone 3 — Selective Repeat
 
-Not yet measured; milestone 3 is not implemented.
+Measured at commit `e768f12` (the M3 tree), Debug build, same 10 MiB file and
+same machine as above. Window sizes 1, 8 and 32 only: 4, 16 and 64 were dropped
+at the user's request to keep the run short. Window 1 is included because it
+makes the Selective Repeat code reproduce stop-and-wait exactly, so the
+comparison runs through one code path rather than two.
+
+### Condition A: loopback, no artificial delay
+
+| window | loss | run | elapsed s | throughput Mbps | packets sent | retransmissions |
+|---|---|---|---|---|---|---|
+| 1 | 0% | 1 | 1.2057 | 69.572 | 8740 | 0 |
+| 1 | 0% | 2 | 1.2320 | 68.091 | 8740 | 0 |
+| 1 | 0% | 3 | 1.4913 | 56.249 | 8740 | 0 |
+| 1 | 1% | 1 | 31.3118 | 2.679 | 8835 | 95 |
+| 1 | 1% | 2 | 24.4321 | 3.433 | 8814 | 74 |
+| 1 | 1% | 3 | 34.5649 | 2.427 | 8846 | 106 |
+| 1 | 5% | 1 | 135.5456 | 0.619 | 9174 | 434 |
+| 1 | 5% | 2 | 142.8843 | 0.587 | 9200 | 460 |
+| 1 | 5% | 3 | 141.0298 | 0.595 | 9191 | 451 |
+| 8 | 0% | 1 | 0.1177 | 712.993 | 8740 | 0 |
+| 8 | 0% | 2 | 0.1010 | 830.605 | 8740 | 0 |
+| 8 | 0% | 3 | 0.1199 | 699.778 | 8740 | 0 |
+| 8 | 1% | 1 | 27.3586 | 3.066 | 8838 | 98 |
+| 8 | 1% | 2 | 27.2903 | 3.074 | 8834 | 94 |
+| 8 | 1% | 3 | 30.4446 | 2.755 | 8846 | 106 |
+| 8 | 5% | 1 | 109.0075 | 0.770 | 9206 | 466 |
+| 8 | 5% | 2 | 106.4077 | 0.788 | 9196 | 456 |
+| 8 | 5% | 3 | 102.9282 | 0.815 | 9198 | 458 |
+| 32 | 0% | 1 | 0.1825 | 459.672 | 8740 | 0 |
+| 32 | 0% | 2 | 0.1261 | 665.151 | 8740 | 0 |
+| 32 | 0% | 3 | 0.0937 | 895.694 | 8740 | 0 |
+| 32 | 1% | 1 | 18.9509 | 4.426 | 8823 | 83 |
+| 32 | 1% | 2 | 19.8900 | 4.217 | 8831 | 91 |
+| 32 | 1% | 3 | 18.9669 | 4.423 | 8828 | 88 |
+| 32 | 5% | 1 | 56.1275 | 1.495 | 9183 | 443 |
+| 32 | 5% | 2 | 57.0588 | 1.470 | 9178 | 438 |
+| 32 | 5% | 3 | 54.2715 | 1.546 | 9171 | 431 |
+
+All 27 runs verified byte-identical.
+
+### Condition B: 26.4 ms RTT (delay proxy, see the M2 note)
+
+Three runs at window 8 and 32; **one** run at window 1, because each such run
+takes nearly four minutes and the M2 table already records three at that
+setting. Single runs are labelled as such rather than presented as a mean.
+
+| window | loss | run | elapsed s | throughput Mbps | packets sent | retransmissions |
+|---|---|---|---|---|---|---|
+| 1 | 0% | 1 (single run) | 227.0879 | 0.369 | 8741 | 1 |
+| 8 | 0% | 1 | 28.3185 | 2.962 | 8740 | 0 |
+| 8 | 0% | 2 | 28.5250 | 2.941 | 8740 | 0 |
+| 8 | 0% | 3 | 28.5132 | 2.942 | 8740 | 0 |
+| 32 | 0% | 1 | 7.1461 | 11.739 | 8740 | 0 |
+| 32 | 0% | 2 | 7.1392 | 11.750 | 8740 | 0 |
+| 32 | 0% | 3 | 7.1750 | 11.691 | 8740 | 0 |
+
+The loss columns of Condition B were **not measured** — the run was trimmed for
+time, and estimating them would be fabrication.
+
+### What the window buys
+
+Throughput on an RTT-bound path should be `window x chunk / RTT`. Against the
+measured 26.4 ms RTT and 1200-byte chunks:
+
+| window | predicted Mbps | measured Mbps | error |
+|---|---|---|---|
+| 1 | 0.364 | 0.369 | +1.4% |
+| 8 | 2.909 | 2.941–2.962 | +1.1% to +1.8% |
+| 32 | 11.636 | 11.691–11.750 | +0.5% to +1.0% |
+
+Scaling is linear in the window size to within 2% across a 32x range: window 8
+is 8.0x window 1, window 32 is 31.8x. That is the entire thesis of milestone 3,
+and it is measured rather than asserted.
+
+### Bandwidth-delay product
+
+BDP = bandwidth x RTT. Using the highest throughput this machine actually
+sustained on loopback with no artificial delay (895.694 Mbps, window 32 run 3)
+as the path capacity:
+
+```
+BDP = 895.694e6 bit/s x 0.0264 s = 23.6 Mbit = 2.96 MB
+    = 2.96e6 / 1200 = about 2460 packets in flight to fill the pipe
+```
+
+**Every window size tested — 1, 8 and 32 — is far below the BDP of ~2460
+packets.** That is precisely why throughput scaled linearly with no sign of
+levelling off: none of them came close to filling the path, so each extra
+packet in flight bought its full share of bandwidth. The curve would only bend
+as the window approached ~2460, at which point the link, not the RTT, becomes
+the limit.
+
+That figure is theoretical for this setup, though: see the receive-buffer
+ceiling below, which binds long before the BDP does.
+
+---
+
+## Milestone 6 — full system, and two effects worth knowing
+
+Measured at the M6 tree with `scripts/benchmark.sh`, 10 MiB, loopback, 0% loss.
+This is the complete system: handshake, per-packet CRC32, end-to-end SHA-256,
+and the epoll server.
+
+| build | window | run | elapsed s | throughput Mbps | retransmissions |
+|---|---|---|---|---|---|
+| Debug (`-O0`) | 1 | 1 | 0.8991 | 93.295 | 1 |
+| Debug | 1 | 2 | 0.9560 | 87.751 | 1 |
+| Debug | 8 | 1 | 0.4565 | 183.746 | 1 |
+| Debug | 8 | 2 | 0.4757 | 176.333 | 1 |
+| Debug | 32 | 1 | 0.4047 | 207.287 | 0 |
+| Debug | 32 | 2 | 0.4415 | 190.019 | 0 |
+| Release (`-O3`) | 1 | 1 | 0.6227 | 134.720 | 0 |
+| Release | 1 | 2 | 0.5381 | 155.897 | 0 |
+| Release | 8 | 1 | 0.1400 | 599.256 | 0 |
+| Release | 8 | 2 | 0.1305 | 642.846 | 0 |
+| Release | 32 | 1 | 0.1230 | 681.850 | 0 |
+| Release | 32 | 2 | 0.1005 | 835.055 | 0 |
+
+### Effect 1: the Debug build is dominated by unoptimised crypto
+
+Window 32 measured 207 Mbps in Debug against 835 Mbps in Release — a 4x gap
+that is entirely explained rather than hand-waved. Timing the primitives
+directly on 10 MiB:
+
+| | `-O0` | `-O2` |
+|---|---|---|
+| SHA-256 | 355.5 ms (28 MB/s) | 55.8 ms (179 MB/s) |
+| CRC-32 | 67.6 ms (148 MB/s) | 35.6 ms (281 MB/s) |
+
+The receiver hashes the completed file *inside* the window the client is
+timing, so the Debug SHA-256 alone adds ~355 ms to every transfer. The Debug
+window-8 time was 0.4565 s against M3's 0.1010 s — a gap of 0.356 s, matching
+the measured SHA-256 cost almost exactly. Release throughput (835 Mbps) is back
+in line with M3's pre-integrity numbers (895 Mbps).
+
+Lesson worth stating plainly: `CMAKE_BUILD_TYPE` defaults to Debug in this
+project, and any benchmark that forgets to set Release is really measuring
+`-O0` SHA-256.
+
+### Effect 2: window 128 collapses — the receive buffer, not the network
+
+| build | window | run | elapsed s | throughput Mbps | packets sent | retransmissions |
+|---|---|---|---|---|---|---|
+| Debug | 128 | 1 | 4.6346 | 18.100 | 9188 | 447 |
+| Debug | 128 | 2 | 3.9523 | 21.225 | 9148 | 407 |
+| Release | 128 | 1 | 8.2187 | 10.207 | 9704 | 963 |
+| Release | 128 | 2 | 6.5989 | 12.712 | 9377 | 636 |
+
+Hundreds of retransmissions at **zero simulated loss**, and a 7x throughput
+collapse against window 32. Nothing was dropping these packets except the
+kernel: the receiver's socket buffer is `net.core.rmem_max = 212992` bytes, and
+the kernel charges each queued datagram roughly its payload plus several
+hundred bytes of `sk_buff` overhead. At about 2 KB charged per 1240-byte
+packet, the queue holds on the order of 100 packets. A window of 128 overruns
+it, the kernel discards the excess, and the sender's retransmission timers
+recover them one 300 ms RTO at a time.
+
+This is the real ceiling on window size for this configuration, and it binds far
+earlier than the ~2460-packet BDP computed above. Raising it means
+`SO_RCVBUF`/`net.core.rmem_max`, which is listed in docs/todo.md — it needs
+root, so it was not attempted here rather than being guessed at.

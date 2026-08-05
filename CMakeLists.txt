@@ -126,3 +126,16 @@ target_link_libraries(crypto_tests
   PRIVATE swiftlink_crypto swiftlink_protocol swiftlink_transfer swiftlink_warnings)
 
 add_test(NAME crypto_tests COMMAND crypto_tests)
+
+add_executable(window_tests tests/window_tests.cpp)
+target_link_libraries(window_tests
+  PRIVATE swiftlink_transfer swiftlink_warnings)
+
+add_test(NAME window_tests COMMAND window_tests)
+
+# Integration tests drive the real binaries over real UDP, so they depend on
+# the executables rather than linking anything.
+add_test(NAME integration_tests
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/integration_test.sh
+          ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(integration_tests PROPERTIES TIMEOUT 300)

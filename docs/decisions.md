@@ -205,3 +205,25 @@ Sweeping on the timerfd keeps the per-packet path free of bookkeeping that is
 not needed at packet rate. The cost is that a session can linger up to one
 sweep interval past its deadline, which is why the observed timeout in testing
 was 1833 ms against a 1500 ms limit with a 500 ms sweep.
+
+## 2026-08-05 — M6: benchmark runs are verified, and failures are not reported as numbers
+scripts/benchmark.sh compares the received file's SHA-256 against the source on
+every run and prints FAILED instead of a throughput figure when they differ. A
+throughput number from a transfer that did not reproduce the file is worse than
+no number, because it looks usable.
+
+## 2026-08-05 — Test macros must not double-evaluate
+The first window test suite used a CHECK_EQ macro that mentioned its argument
+in both the comparison and the failure message. Since expire() has side
+effects, the macro consumed the timers it was meant to observe, producing three
+failures reading "expected: 1 actual: 1". CHECK_EQ is now a function template,
+so arguments are evaluated exactly once. Worth remembering: a test harness bug
+looks exactly like a production bug until you read the expansion.
+
+## 2026-08-05 — Window size is bounded by the receive buffer, not by the BDP
+Window 128 produces hundreds of retransmissions at zero simulated loss, because
+net.core.rmem_max is 212992 bytes and the kernel charges each queued datagram
+its payload plus sk_buff overhead -- roughly 100 packets of capacity. The
+computed bandwidth-delay product for the 26.4 ms path is ~2460 packets, so the
+socket buffer binds about 25x earlier than the BDP does. Sizing a window from
+the BDP alone would be wrong on this machine.
