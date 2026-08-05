@@ -169,3 +169,39 @@ means an off-path attacker must guess it to interfere.
 If our START_ACK is lost the client resends START. Re-running the open path
 would apply O_TRUNC and discard everything received so far, so a duplicate
 START with a matching session id is simply acknowledged again.
+
+## 2026-08-05 — M5: sessions keyed on client address *and* session id
+Address alone is insufficient: NAT puts many clients behind one address, and a
+single client can run concurrent transfers from different source ports. Session
+id alone is insufficient too -- the client chooses it, so two clients could
+collide, and an off-path attacker who guessed one could write into another
+transfer. Requiring both means an attacker must guess the id *and* forge the
+source address.
+
+## 2026-08-05 — Single-threaded epoll rather than a thread per session
+A session is almost entirely I/O wait, and the work per packet is small and
+bounded: decode, one pwrite, one sendto. A thread each would spend its memory
+and scheduler pressure on sleeping and would force locking around shared state.
+One loop means there is no shared mutable state to protect, because only one
+thread touches it.
+
+## 2026-08-05 — Time and signals are turned into file descriptors
+timerfd drives the idle sweep and signalfd delivers SIGINT/SIGTERM, so the loop
+has exactly one blocking point. The usual alternative -- a signal handler
+setting a volatile flag -- is constrained by async-signal-safety and races with
+the blocking call itself, since a signal arriving just before epoll_wait would
+not interrupt it. Note sigprocmask must block the signals first: signalfd does
+not suppress normal delivery, so without it the first SIGINT kills the process
+before the loop ever reads it.
+
+## 2026-08-05 — Only START may create a session
+Any other packet type for an unknown key is ignored rather than answered, so a
+stray or hostile datagram cannot make the server allocate state. This is the
+cheap half of DoS resistance; the expensive half (rate limiting, handshake
+cookies) is listed in docs/todo.md.
+
+## 2026-08-05 — Idle sessions are swept on a timer, not on every packet
+Sweeping on the timerfd keeps the per-packet path free of bookkeeping that is
+not needed at packet rate. The cost is that a session can linger up to one
+sweep interval past its deadline, which is why the observed timeout in testing
+was 1833 ms against a 1500 ms limit with a 500 ms sweep.

@@ -1,12 +1,16 @@
-// SwiftLink server: receive one file, write it, print statistics, exit.
+// SwiftLink server: concurrent, epoll-driven, many sessions at once.
 //
-//   swiftlink_server <port> <output-dir> [--idle-ms=N] [--quiet]
+//   swiftlink_server <port> <output-dir> [options]
+//     --idle-ms=N     abandon a session after N ms of silence (default 30000)
+//     --sweep-ms=N    how often to sweep for idle sessions (default 1000)
+//     --window=N      duplicate-detection window (default 1024)
+//     --quiet         suppress per-session chatter
 //
-// The filename comes from the client's START packet and is sanitised to a bare
-// name before being joined to <output-dir>, so a client cannot write outside it.
-//
-// One transfer per process, sequentially. Concurrency arrives in milestone 5
-// with epoll; until then the point is the reliability logic, not the plumbing.
+// Runs until SIGINT or SIGTERM, then shuts down cleanly. The filename comes
+// from each client's START packet and is sanitised to a bare name before being
+// joined to <output-dir>, so a client cannot write outside it.
+
+#include <sys/stat.h>
 
 #include <cerrno>
 #include <charconv>
@@ -16,22 +20,9 @@
 #include <string>
 #include <string_view>
 
-#include <sys/stat.h>
-
-#include "swiftlink/net/udp_socket.hpp"
-#include "swiftlink/transfer/receiver.hpp"
-#include "swiftlink/transfer/transfer.hpp"
+#include "swiftlink/server/epoll_server.hpp"
 
 namespace {
-
-namespace xfer = swiftlink::transfer;
-
-struct Options {
-  std::uint16_t port = 9000;
-  std::string output_directory;
-  xfer::ReceiverConfig receiver;
-  bool quiet = false;
-};
 
 [[nodiscard]] bool parse_unsigned(std::string_view text, unsigned long long& out) {
   const auto result =
@@ -39,7 +30,8 @@ struct Options {
   return result.ec == std::errc{} && result.ptr == text.data() + text.size();
 }
 
-[[nodiscard]] bool parse_options(int argc, char** argv, Options& options) {
+[[nodiscard]] bool parse_options(int argc, char** argv,
+                                 swiftlink::server::ServerConfig& config) {
   int positional = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -51,17 +43,30 @@ struct Options {
       const std::string_view value =
           (equals == std::string_view::npos) ? std::string_view{}
                                              : arg.substr(equals + 1);
+      unsigned long long number = 0;
 
       if (name == "--quiet") {
-        options.quiet = true;
+        config.verbose = false;
       } else if (name == "--idle-ms") {
-        unsigned long long ms = 0;
-        if (!parse_unsigned(value, ms) || ms == 0) {
+        if (!parse_unsigned(value, number) || number == 0) {
           std::cerr << "--idle-ms expects a positive integer\n";
           return false;
         }
-        options.receiver.idle_timeout =
-            std::chrono::milliseconds{static_cast<long>(ms)};
+        config.session_idle_timeout =
+            std::chrono::milliseconds{static_cast<long>(number)};
+      } else if (name == "--sweep-ms") {
+        if (!parse_unsigned(value, number) || number == 0) {
+          std::cerr << "--sweep-ms expects a positive integer\n";
+          return false;
+        }
+        config.sweep_interval =
+            std::chrono::milliseconds{static_cast<long>(number)};
+      } else if (name == "--window") {
+        if (!parse_unsigned(value, number) || number == 0) {
+          std::cerr << "--window expects a positive integer\n";
+          return false;
+        }
+        config.window_size = static_cast<std::uint32_t>(number);
       } else {
         std::cerr << "unknown option: " << arg << '\n';
         return false;
@@ -76,11 +81,11 @@ struct Options {
           std::cerr << "invalid port: " << arg << '\n';
           return false;
         }
-        options.port = static_cast<std::uint16_t>(port);
+        config.port = static_cast<std::uint16_t>(port);
         break;
       }
       case 1:
-        options.output_directory = arg;
+        config.output_directory = arg;
         break;
       default:
         std::cerr << "unexpected argument: " << arg << '\n';
@@ -90,7 +95,7 @@ struct Options {
 
   if (positional < 2) {
     std::cerr << "usage: swiftlink_server <port> <output-dir> "
-                 "[--idle-ms=N] [--quiet]\n";
+                 "[--idle-ms=N] [--sweep-ms=N] [--window=N] [--quiet]\n";
     return false;
   }
   return true;
@@ -99,57 +104,16 @@ struct Options {
 }  // namespace
 
 int main(int argc, char** argv) {
-  Options options;
-  if (!parse_options(argc, argv, options)) {
+  swiftlink::server::ServerConfig config;
+  if (!parse_options(argc, argv, config)) {
     return 2;
   }
 
-  // Create the output directory if it does not exist. EEXIST is fine.
-  if (::mkdir(options.output_directory.c_str(), 0755) != 0 && errno != EEXIST) {
-    std::cerr << std::format("mkdir({}) failed: {}\n", options.output_directory,
+  if (::mkdir(config.output_directory.c_str(), 0755) != 0 && errno != EEXIST) {
+    std::cerr << std::format("mkdir({}) failed: {}\n", config.output_directory,
                              std::strerror(errno));
     return 1;
   }
 
-  swiftlink::net::UdpSocket socket;
-  if (!socket.open()) {
-    std::cerr << std::format("socket() failed: {}\n", std::strerror(errno));
-    return 1;
-  }
-  if (!socket.bind(options.port)) {
-    std::cerr << std::format("bind({}) failed: {}\n", options.port,
-                             std::strerror(errno));
-    return 1;
-  }
-
-  if (!options.quiet) {
-    std::cout << std::format("swiftlink server on 0.0.0.0:{} -> {}/\n",
-                             options.port, options.output_directory);
-  }
-  // Unbuffered, so a benchmark script can wait for this line before starting
-  // the client and know the socket is genuinely bound.
-  std::cout << "READY" << std::endl;
-
-  xfer::TransferStats stats;
-  std::string written_path;
-  const xfer::TransferError error = xfer::receive_file(
-      socket, options.output_directory, options.receiver, stats, written_path);
-
-  if (error != xfer::TransferError::kNone) {
-    std::cerr << std::format("receive failed: {}\n", xfer::to_string(error));
-    return 1;
-  }
-
-  if (!options.quiet) {
-    std::cout << std::format("wrote {}\n", written_path);
-  }
-
-  std::cout << std::format(
-      "STATS elapsed_s={:.4f} throughput_mbps={:.3f} bytes={} chunks={} "
-      "packets_received={} duplicates={} out_of_order={}\n",
-      stats.elapsed_seconds, stats.throughput_mbps(), stats.bytes_transferred,
-      stats.chunks, stats.packets_received, stats.duplicates_received,
-      stats.out_of_order_received);
-
-  return 0;
+  return swiftlink::server::run(config);
 }

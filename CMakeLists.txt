@@ -91,7 +91,9 @@ target_link_libraries(swiftlink_transfer
 # ---------------------------------------------------------------------------
 # Executables: the only place the layers are wired together.
 # ---------------------------------------------------------------------------
-add_executable(swiftlink_server src/server/server_main.cpp)
+add_executable(swiftlink_server
+  src/server/server_main.cpp
+  src/server/epoll_server.cpp)
 target_link_libraries(swiftlink_server
   PRIVATE swiftlink_transfer swiftlink_warnings)
 

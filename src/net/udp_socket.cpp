@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -111,6 +112,22 @@ bool UdpSocket::set_receive_timeout(std::chrono::microseconds timeout) noexcept 
   tv.tv_usec = static_cast<suseconds_t>((timeout - seconds).count());
 
   return ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+bool UdpSocket::set_nonblocking(bool enabled) noexcept {
+  if (!valid()) {
+    errno = EBADF;
+    return false;
+  }
+
+  // Read-modify-write rather than a bare F_SETFL: overwriting the flags word
+  // would clobber anything else set on the descriptor.
+  const int flags = ::fcntl(fd_, F_GETFL, 0);
+  if (flags < 0) {
+    return false;
+  }
+  const int updated = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+  return ::fcntl(fd_, F_SETFL, updated) == 0;
 }
 
 std::ptrdiff_t UdpSocket::send_to(std::span<const std::byte> bytes,

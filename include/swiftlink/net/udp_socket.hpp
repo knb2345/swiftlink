@@ -73,6 +73,11 @@ class UdpSocket {
   // flight, a receive timeout is simpler and does the same job.
   [[nodiscard]] bool set_receive_timeout(std::chrono::microseconds timeout) noexcept;
 
+  // O_NONBLOCK. With it set, recv_from returns -1/EAGAIN on an empty queue
+  // instead of sleeping, which is what lets one epoll loop serve many sessions
+  // without any of them blocking the others.
+  [[nodiscard]] bool set_nonblocking(bool enabled) noexcept;
+
   [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
   [[nodiscard]] int fd() const noexcept { return fd_; }
 
