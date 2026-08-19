@@ -3,6 +3,10 @@
 //   swiftlink_server <port> <output-dir> [options]
 //     --idle-ms=N     abandon a session after N ms of silence (default 30000)
 //     --sweep-ms=N    how often to sweep for idle sessions (default 1000)
+//     --linger-ms=N   keep a completed session this long, so a retransmitted
+//                     FIN is still answered (default 20000; 0 disables)
+//     --max-sessions=N  refuse new sessions past this many in progress
+//                     (default 256)
 //     --window=N      duplicate-detection window (default 1024)
 //     --quiet         suppress per-session chatter
 //
@@ -61,6 +65,19 @@ namespace {
         }
         config.sweep_interval =
             std::chrono::milliseconds{static_cast<long>(number)};
+      } else if (name == "--linger-ms") {
+        if (!parse_unsigned(value, number)) {
+          std::cerr << "--linger-ms expects a non-negative integer\n";
+          return false;
+        }
+        config.session_linger =
+            std::chrono::milliseconds{static_cast<long>(number)};
+      } else if (name == "--max-sessions") {
+        if (!parse_unsigned(value, number) || number == 0) {
+          std::cerr << "--max-sessions expects a positive integer\n";
+          return false;
+        }
+        config.max_sessions = static_cast<std::size_t>(number);
       } else if (name == "--window") {
         if (!parse_unsigned(value, number) || number == 0) {
           std::cerr << "--window expects a positive integer\n";
@@ -95,7 +112,9 @@ namespace {
 
   if (positional < 2) {
     std::cerr << "usage: swiftlink_server <port> <output-dir> "
-                 "[--idle-ms=N] [--sweep-ms=N] [--window=N] [--quiet]\n";
+                 "[--idle-ms=N] [--sweep-ms=N] [--linger-ms=N] "
+                 "[--max-sessions=N] [--window=N] "
+                 "[--quiet]\n";
     return false;
   }
   return true;

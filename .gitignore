@@ -12,3 +12,5 @@ test_files/
 *.iso
 perf.data*
 .vscode/
+build-release/
+build-*/

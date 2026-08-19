@@ -12,6 +12,7 @@ bool is_valid_status_code(std::uint8_t raw) noexcept {
     case StatusCode::kSizeMismatch:
     case StatusCode::kUnknownSession:
     case StatusCode::kInternalError:
+    case StatusCode::kServerBusy:
       return true;
   }
   return false;
@@ -35,6 +36,8 @@ std::string_view to_string(StatusCode code) noexcept {
       return "no such session";
     case StatusCode::kInternalError:
       return "internal error";
+    case StatusCode::kServerBusy:
+      return "server is at its session limit";
   }
   return "unknown status";
 }

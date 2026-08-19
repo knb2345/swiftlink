@@ -51,6 +51,24 @@ struct ServerConfig {
   // bookkeeping that is not needed at packet rate.
   std::chrono::milliseconds sweep_interval{1000};
 
+  // How long a completed session is kept after its FIN_ACK has been sent.
+  //
+  // Erasing on completion loses the ability to answer a retransmitted FIN, and
+  // then a sender whose FIN_ACK was dropped retries until its budget runs out
+  // and reports failure for a file that arrived intact. The default outlives
+  // that budget -- kMaxRetriesPerChunk x kDefaultRto is 15 s -- so the server
+  // is still there for any sender that is still asking.
+  std::chrono::milliseconds session_linger{20000};
+
+  // Ceiling on simultaneous in-progress sessions.
+  //
+  // Only START may allocate, which stops the cheapest attack, but nothing else
+  // stopped a flood of STARTs from one stranger from allocating without bound:
+  // a measured 4000 STARTs produced 4000 sessions and 4000 files. This bounds
+  // the damage. It is a mitigation and not the real fix, which is a stateless
+  // SYN-cookie-style handshake -- see docs/todo.md.
+  std::size_t max_sessions = 256;
+
   std::uint32_t window_size = transfer::kDefaultReceiverWindowSize;
   bool verbose = true;
 };

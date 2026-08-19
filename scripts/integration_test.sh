@@ -15,6 +15,7 @@ set -u
 BUILD="${1:-$(cd "$(dirname "$0")/.." && pwd)/build}"
 CLIENT="$BUILD/swiftlink_client"
 SERVER="$BUILD/swiftlink_server"
+PROXY="$BUILD/delay_proxy"
 
 if [ ! -x "$CLIENT" ] || [ ! -x "$SERVER" ]; then
   echo "missing binaries in $BUILD (build first)" >&2
@@ -157,6 +158,58 @@ if [ -e /tmp/swiftlink_pwned ]; then
 else
   echo "[  PASS  ] traversal containment (nothing written outside output dir)"
   PASS=$((PASS + 1))
+fi
+
+# Reverse-path loss: the FIN_ACK itself can be the packet that goes missing.
+#
+# This case exists because of a real defect. --simulate-loss drops only
+# *outbound* datagrams at the client, so nothing above this line can ever lose
+# an ACK, and the bug hid there for four milestones: the server erased a
+# session the instant it completed, so a retransmitted FIN found nobody home
+# and the sender reported failure for a file already sitting complete and
+# byte-identical on disk. Reproduced at 9 failures in 20 runs with 30% reverse
+# loss; the fix is the linger window in ServerConfig.
+#
+# The proxy impairs only the server->client direction, which is the half
+# --simulate-loss cannot reach.
+if [ -x "$PROXY" ]; then
+  rev_ok=1
+  rev_detail=""
+  for i in 1 2 3 4 5 6; do
+    pport=$(( PORT + 1000 + i ))
+    "$PROXY" "$pport" "$PORT" 2000 20000 --seed=$(( 900 + i )) \
+      --loss=40% --impair=to-client > "$WORK/proxy$i.log" 2>&1 &
+    prx=$!
+    for _ in $(seq 1 100); do
+      grep -q READY "$WORK/proxy$i.log" 2>/dev/null && break
+      sleep 0.05
+    done
+
+    rm -f "$DST/rev$i.bin"
+    cp "$SRC/multi.bin" "$SRC/rev$i.bin"
+    if ! timeout 120 "$CLIENT" 127.0.0.1 "$pport" "$SRC/rev$i.bin" --quiet \
+         --rto-ms=100 > "$WORK/rev$i.log" 2>&1; then
+      rev_ok=0
+      rev_detail="run $i: $(tail -1 "$WORK/rev$i.log")"
+    fi
+    kill "$prx" 2>/dev/null; wait "$prx" 2>/dev/null
+
+    a=$(sha256sum "$SRC/rev$i.bin" | cut -d' ' -f1)
+    b=$(sha256sum "$DST/rev$i.bin" 2>/dev/null | cut -d' ' -f1)
+    if [ "$a" != "$b" ]; then
+      rev_ok=0
+      rev_detail="run $i: sha256 mismatch"
+    fi
+  done
+  if [ "$rev_ok" = 1 ]; then
+    echo "[  PASS  ] 6 runs at 40% reverse-path loss (FIN_ACK recovery)"
+    PASS=$((PASS + 1))
+  else
+    echo "[  FAIL  ] 6 runs at 40% reverse-path loss ($rev_detail)"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "[  SKIP  ] reverse-path loss (delay_proxy not built)"
 fi
 
 # Concurrency: several clients against the one epoll server at once.

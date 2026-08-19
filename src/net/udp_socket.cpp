@@ -104,6 +104,21 @@ bool UdpSocket::set_receive_timeout(std::chrono::microseconds timeout) noexcept 
     return false;
   }
 
+  // A zero timeval means "no timeout" to SO_RCVTIMEO -- block forever -- which
+  // is the exact opposite of what a caller asking to wait zero microseconds
+  // wants, and it fails in the worst possible way: not an error, just a recv
+  // that never returns.
+  //
+  // A sender computing `deadline - now` produces zero or negative whenever the
+  // deadline has already passed, which is routine under heavy loss when a pass
+  // through the loop takes longer than the RTO. Left alone, that one arithmetic
+  // edge turns into a permanently hung transfer. Clamping to the smallest real
+  // timeout keeps the meaning the caller intended: return immediately with
+  // nothing.
+  if (timeout <= std::chrono::microseconds::zero()) {
+    timeout = std::chrono::microseconds{1};
+  }
+
   // SO_RCVTIMEO takes a struct timeval. Splitting the duration with chrono's
   // duration_cast keeps the seconds/microseconds arithmetic honest.
   const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(timeout);

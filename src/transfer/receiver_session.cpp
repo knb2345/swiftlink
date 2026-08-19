@@ -1,5 +1,9 @@
 #include "swiftlink/transfer/receiver_session.hpp"
 
+#include <stdio.h>
+#include <unistd.h>
+
+#include <format>
 #include <string_view>
 
 #include "swiftlink/crypto/sha256.hpp"
@@ -13,6 +17,17 @@ namespace crypto = swiftlink::crypto;
 ReceiverSession::ReceiverSession(std::uint32_t window_capacity,
                                  std::string output_directory)
     : window_(window_capacity), output_directory_(std::move(output_directory)) {}
+
+ReceiverSession::~ReceiverSession() {
+  // A temporary that was never published belongs to a transfer that did not
+  // finish. Removing it here is what makes "abandoned" mean the output
+  // directory is unchanged, rather than that it holds a truncated file with a
+  // convincing name.
+  if (!published_ && !temp_path_.empty()) {
+    file_.close();
+    ::unlink(temp_path_.c_str());
+  }
+}
 
 ReceiverSession::Reply ReceiverSession::fail(proto::StatusCode code,
                                              TransferError error,
@@ -29,7 +44,9 @@ ReceiverSession::Reply ReceiverSession::fail(proto::StatusCode code,
     payload.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
   }
 
-  return Reply{true, proto::PacketType::kError, sequence, std::move(payload)};
+  final_reply_ = Reply{true, proto::PacketType::kError, sequence,
+                       std::move(payload)};
+  return final_reply_;
 }
 
 ReceiverSession::Reply ReceiverSession::on_start(const proto::Packet& packet) {
@@ -47,6 +64,11 @@ ReceiverSession::Reply ReceiverSession::on_start(const proto::Packet& packet) {
                 TransferError::kProtocolViolation, header.sequence_number);
   }
 
+  // Recorded before anything here can fail, so that a session rejected at
+  // START still recognises the retransmitted START it is about to be asked
+  // about and can replay the same ERROR.
+  session_id_ = header.session_id;
+
   // The filename is entirely attacker-controlled at this point.
   const std::string_view raw(
       reinterpret_cast<const char*>(packet.payload.data()),
@@ -60,12 +82,17 @@ ReceiverSession::Reply ReceiverSession::on_start(const proto::Packet& packet) {
   }
 
   output_path_ = join_path(output_directory_, safe_name);
-  if (!file_.open_write(output_path_)) {
+
+  // The session id is the only thing guaranteed unique across concurrent
+  // transfers -- the filename is not, and is attacker-chosen besides.
+  temp_path_ = join_path(
+      output_directory_, std::format(".swiftlink-{:016x}.partial", session_id_));
+
+  if (!file_.open_write(temp_path_)) {
     return fail(proto::StatusCode::kFileOpenFailed,
                 TransferError::kFileOpenFailed, header.sequence_number);
   }
 
-  session_id_ = header.session_id;
   declared_size_ = header.byte_offset;
   started_ = true;
 
@@ -175,14 +202,59 @@ ReceiverSession::Reply ReceiverSession::on_fin(const proto::Packet& packet) {
     }
   }
 
+  // Verified, so publish it. rename(2) within one directory is atomic, so a
+  // reader of the output directory never observes a half-written file under
+  // its final name -- it is either absent or complete.
+  if (::rename(temp_path_.c_str(), output_path_.c_str()) != 0) {
+    return fail(proto::StatusCode::kInternalError,
+                TransferError::kFileWriteFailed, header.sequence_number);
+  }
+  published_ = true;
+
   finished_ = true;
-  return Reply{true, proto::PacketType::kFinAck, header.sequence_number, {}};
+  final_reply_ =
+      Reply{true, proto::PacketType::kFinAck, header.sequence_number, {}};
+  return final_reply_;
 }
 
 ReceiverSession::Reply ReceiverSession::handle_packet(
     const proto::Packet& packet) {
   const proto::PacketHeader& header = packet.header;
   ++stats_.packets_received;
+
+  // The session is settled, but the peer is still asking -- which means the
+  // answer we sent (FIN_ACK, or ERROR) was lost on the way back. Replay it.
+  //
+  // Dropping these instead is a real bug and not a theoretical one: the sender
+  // has no other way to learn the transfer succeeded, so it retransmits FIN
+  // until its retry budget runs out and then reports failure, for a file that
+  // is complete and byte-identical on disk. The receiver must outlive its own
+  // last packet, the same reason TCP has TIME_WAIT. The driver decides how
+  // long; this class just keeps answering.
+  //
+  // Replaying is safe because it is not recomputed: on_fin() already did the
+  // hashing, and a second FIN returns the stored verdict without touching the
+  // file, so a peer cannot make the server redo O(filesize) work by repeating
+  // itself.
+  if (finished_ && header.session_id == session_id_ && final_reply_.send) {
+    // A FIN_ACK answers a repeated FIN. An ERROR answers whichever control
+    // packet provoked it, since the peer retries that same packet. Anything
+    // else -- a late DATA, a stray ACK -- is ignored: the file is closed and
+    // there is nothing left to say about it.
+    const bool is_control = header.packet_type == proto::PacketType::kFin ||
+                            header.packet_type == proto::PacketType::kStart;
+    const bool matches =
+        final_reply_.type == proto::PacketType::kError
+            ? is_control
+            : header.packet_type == proto::PacketType::kFin;
+    if (matches) {
+      ++stats_.duplicates_received;
+      return final_reply_;
+    }
+  }
+  if (finished_) {
+    return Reply{};
+  }
 
   if (header.packet_type == proto::PacketType::kStart) {
     return on_start(packet);

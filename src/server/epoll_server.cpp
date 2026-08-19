@@ -57,7 +57,38 @@ struct Session {
   net::Endpoint peer;
   Clock::time_point last_activity;
   Clock::time_point started;
+
+  // Set once the transfer has settled. The session stays in the map after
+  // that, holding no file descriptor, purely so a retransmitted FIN still
+  // finds someone to answer it.
+  bool lingering = false;
+  Clock::time_point completed_at;
 };
+
+// Answers a packet we are declining to keep any state about. Written out here
+// rather than through a ReceiverSession, because the entire point is that no
+// session was allocated.
+void send_error(net::UdpSocket& socket, const net::Endpoint& peer,
+                const proto::PacketHeader& request, proto::StatusCode code) {
+  const std::string_view message = proto::to_string(code);
+  std::vector<std::byte> payload;
+  payload.reserve(1 + message.size());
+  payload.push_back(static_cast<std::byte>(code));
+  for (const char c : message) {
+    payload.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+  }
+
+  proto::PacketHeader header;
+  header.packet_type = proto::PacketType::kError;
+  header.session_id = request.session_id;
+  header.sequence_number = request.sequence_number;
+  header.acknowledgement_number = request.sequence_number;
+
+  const std::vector<std::byte> wire = proto::serialize(header, payload);
+  if (socket.send_to(wire, peer) < 0 && errno != EAGAIN) {
+    std::cerr << std::format("sendto failed: {}\n", std::strerror(errno));
+  }
+}
 
 [[nodiscard]] bool add_to_epoll(int epoll_fd, int fd) {
   epoll_event event{};
@@ -155,6 +186,7 @@ int run(const ServerConfig& config) {
   std::uint64_t completed = 0;
   std::uint64_t failed = 0;
   std::uint64_t expired = 0;
+  std::uint64_t refused = 0;
   bool running = true;
 
   while (running) {
@@ -197,6 +229,21 @@ int run(const ServerConfig& config) {
 
         const Clock::time_point now = Clock::now();
         for (auto it = sessions.begin(); it != sessions.end();) {
+          // A settled session is not idle, it is done. It leaves on the linger
+          // clock and is not reported as a timeout, because nothing about it
+          // failed.
+          if (it->second->lingering) {
+            const auto held =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - it->second->completed_at);
+            if (held > config.session_linger) {
+              it = sessions.erase(it);
+            } else {
+              ++it;
+            }
+            continue;
+          }
+
           const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
               now - it->second->last_activity);
           if (idle > config.session_idle_timeout) {
@@ -261,6 +308,35 @@ int run(const ServerConfig& config) {
             continue;
           }
 
+          // Admission control. Lingering sessions are already finished and do
+          // not count against the limit; they are retired early if the table
+          // is under pressure, since answering a retransmitted FIN matters
+          // less than being able to accept new work at all.
+          std::size_t active = 0;
+          for (const auto& entry : sessions) {
+            if (!entry.second->lingering) {
+              ++active;
+            }
+          }
+          if (active >= config.max_sessions) {
+            ++refused;
+            if (config.verbose) {
+              std::cerr << std::format(
+                  "refused session {:016x} from {}:{}: at the {} session "
+                  "limit\n",
+                  key.session_id, peer.address, peer.port, config.max_sessions);
+            }
+            send_error(socket, peer, packet.header,
+                       proto::StatusCode::kServerBusy);
+            continue;
+          }
+          if (sessions.size() >= config.max_sessions * 2) {
+            for (auto scan = sessions.begin(); scan != sessions.end();) {
+              scan = scan->second->lingering ? sessions.erase(scan)
+                                             : std::next(scan);
+            }
+          }
+
           auto session = std::make_unique<Session>(config.window_size,
                                                    config.output_directory);
           session->peer = peer;
@@ -294,7 +370,7 @@ int run(const ServerConfig& config) {
           }
         }
 
-        if (session.receiver.finished()) {
+        if (session.receiver.finished() && !session.lingering) {
           const xfer::TransferStats& stats = session.receiver.stats();
           const double elapsed =
               std::chrono::duration<double>(Clock::now() - session.started)
@@ -318,15 +394,28 @@ int run(const ServerConfig& config) {
                                      xfer::to_string(session.receiver.error()));
           }
 
-          sessions.erase(it);
+          // Deliberately not erased. The file is closed here because the
+          // bytes are already fsynced, but the session entry stays until the
+          // sweep retires it, so a retransmitted FIN is answered rather than
+          // ignored.
+          session.receiver.close_file();
+          session.lingering = true;
+          session.completed_at = Clock::now();
         }
       }
     }
   }
 
   // Sessions still open at shutdown are incomplete by definition: their files
-  // are partial. They are reported rather than silently dropped.
+  // are partial. They are reported rather than silently dropped. Lingering
+  // sessions are not among them -- they have already been counted as completed
+  // or failed, and are only still present to answer a retransmitted FIN.
+  std::uint64_t abandoned = 0;
   for (const auto& [key, session] : sessions) {
+    if (session->lingering) {
+      continue;
+    }
+    ++abandoned;
     std::cerr << std::format(
         "session {:016x} from {}:{} abandoned at shutdown ({} bytes written)\n",
         key.session_id, key.address, key.port,
@@ -334,8 +423,9 @@ int run(const ServerConfig& config) {
   }
 
   std::cout << std::format(
-      "shutdown: {} completed, {} failed, {} timed out, {} abandoned\n",
-      completed, failed, expired, sessions.size());
+      "shutdown: {} completed, {} failed, {} timed out, {} abandoned, "
+      "{} refused\n",
+      completed, failed, expired, abandoned, refused);
 
   return 0;
 }

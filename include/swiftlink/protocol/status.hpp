@@ -22,6 +22,7 @@ enum class StatusCode : std::uint8_t {
   kSizeMismatch = 5,          // byte count disagrees with the declared size
   kUnknownSession = 6,        // packet for a session we have no record of
   kInternalError = 7,
+  kServerBusy = 8,            // at its session limit; try again later
 };
 
 [[nodiscard]] bool is_valid_status_code(std::uint8_t raw) noexcept;

@@ -14,6 +14,18 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
+# A Debug build is fine to develop against and useless to measure. The
+# from-scratch SHA-256 runs at 28 MB/s under -O0 against 179 MB/s under -O2,
+# and the receiver hashes the whole file inside the window the client is
+# timing, so a forgotten CMAKE_BUILD_TYPE quietly turns a throughput benchmark
+# into a measurement of unoptimised crypto. Measured in docs/benchmarks.md.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(WARNING
+    "CMAKE_BUILD_TYPE=Debug: SHA-256 runs ~6x slower here than at -O2, and the "
+    "receiver hashes inside the timed window. Configure with "
+    "-DCMAKE_BUILD_TYPE=Release before running any benchmark.")
+endif()
+
 # Shared warning flags, attached to every target below rather than set globally,
 # so they never leak into anything the project might pull in later.
 add_library(swiftlink_warnings INTERFACE)
@@ -133,9 +145,28 @@ target_link_libraries(window_tests
 
 add_test(NAME window_tests COMMAND window_tests)
 
+add_executable(session_tests tests/session_tests.cpp)
+target_link_libraries(session_tests
+  PRIVATE swiftlink_transfer swiftlink_crypto swiftlink_protocol
+          swiftlink_warnings)
+
+add_test(NAME session_tests COMMAND session_tests)
+
+add_executable(net_tests tests/net_tests.cpp)
+target_link_libraries(net_tests PRIVATE swiftlink_net swiftlink_warnings)
+
+add_test(NAME net_tests COMMAND net_tests)
+
 # Integration tests drive the real binaries over real UDP, so they depend on
 # the executables rather than linking anything.
 add_test(NAME integration_tests
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/integration_test.sh
           ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(integration_tests PROPERTIES TIMEOUT 300)
+
+# Hostile input drives the server with malformed and abusive datagrams built
+# independently of our own serialiser, so it needs the binaries too.
+add_test(NAME hostile_input_tests
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/hostile_input_test.sh
+          ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(hostile_input_tests PROPERTIES TIMEOUT 300)

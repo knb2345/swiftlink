@@ -34,6 +34,13 @@ class ReceiverSession {
   // cannot be talked into writing outside it.
   ReceiverSession(std::uint32_t window_capacity, std::string output_directory);
 
+  // Removes the temporary file if the transfer never reached a verified FIN,
+  // so an abandoned session leaves nothing behind.
+  ~ReceiverSession();
+
+  ReceiverSession(const ReceiverSession&) = delete;
+  ReceiverSession& operator=(const ReceiverSession&) = delete;
+
   [[nodiscard]] Reply handle_packet(const protocol::Packet& packet);
 
   [[nodiscard]] bool started() const noexcept { return started_; }
@@ -45,6 +52,11 @@ class ReceiverSession {
   }
   [[nodiscard]] const TransferStats& stats() const noexcept { return stats_; }
   [[nodiscard]] TransferStats& stats() noexcept { return stats_; }
+
+  // Releases the output file while the session lingers to answer retransmitted
+  // FINs. The bytes are already on disk and fsynced by then, so the descriptor
+  // buys nothing and would otherwise be held for the whole linger window.
+  void close_file() noexcept { file_.close(); }
 
  private:
   [[nodiscard]] Reply on_start(const protocol::Packet& packet);
@@ -58,7 +70,22 @@ class ReceiverSession {
   io::File file_;
   ReceiverWindow window_;
   std::string output_directory_;
+
+  // Where the bytes will end up. Nothing is written here until the transfer
+  // has been verified.
   std::string output_path_;
+
+  // Where the bytes actually go while the transfer is in progress: a private
+  // name derived from the session id, renamed over output_path_ only once the
+  // SHA-256 check has passed.
+  //
+  // This is what stops two concurrent transfers that advertise the same
+  // filename from interleaving their writes into one file, and what keeps a
+  // failed or abandoned transfer from leaving a plausible-looking partial file
+  // in the output directory. A name in the output directory is therefore
+  // always a complete, verified file.
+  std::string temp_path_;
+  bool published_ = false;
 
   std::uint64_t session_id_ = 0;
   std::uint64_t declared_size_ = 0;
@@ -66,6 +93,10 @@ class ReceiverSession {
 
   bool started_ = false;
   bool finished_ = false;
+
+  // The answer this session settled on, kept so a retransmitted FIN can be
+  // answered again. See the linger note in handle_packet().
+  Reply final_reply_;
   TransferError error_ = TransferError::kNone;
   TransferStats stats_;
 };

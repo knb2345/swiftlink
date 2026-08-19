@@ -348,3 +348,134 @@ This is the real ceiling on window size for this configuration, and it binds far
 earlier than the ~2460-packet BDP computed above. Raising it means
 `SO_RCVBUF`/`net.core.rmem_max`, which is listed in docs/todo.md — it needs
 root, so it was not attempted here rather than being guessed at.
+
+---
+
+## Hardening pass — the window sweep, and where the ceiling actually is
+
+Measured on the post-hardening tree, **Release (`-O3`)**, same machine as
+above. Milestone 6 measured windows 1, 8, 32 and 128 and could say only that
+something broke somewhere below 128. This sweep finds it.
+
+### Condition A: loopback, no artificial delay, 10 MiB, 0% loss
+
+| window | loss | run | elapsed s | throughput Mbps | packets sent | retransmissions | verify |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.00 | 1 | 1.4458 | 58.020 | 8741 | 0 | ok |
+| 1 | 0.00 | 2 | 1.6047 | 52.274 | 8741 | 0 | ok |
+| 2 | 0.00 | 1 | 0.7243 | 115.818 | 8741 | 0 | ok |
+| 2 | 0.00 | 2 | 0.7144 | 117.423 | 8741 | 0 | ok |
+| 4 | 0.00 | 1 | 0.2830 | 296.410 | 8741 | 0 | ok |
+| 4 | 0.00 | 2 | 0.2782 | 301.504 | 8741 | 0 | ok |
+| 8 | 0.00 | 1 | 0.2432 | 344.899 | 8741 | 0 | ok |
+| 8 | 0.00 | 2 | 0.2848 | 294.579 | 8741 | 0 | ok |
+| 16 | 0.00 | 1 | 0.2867 | 292.630 | 8741 | 0 | ok |
+| 16 | 0.00 | 2 | 0.3780 | 221.932 | 8741 | 0 | ok |
+| 32 | 0.00 | 1 | 0.2636 | 318.213 | 8741 | 0 | ok |
+| 32 | 0.00 | 2 | 0.2418 | 346.953 | 8741 | 0 | ok |
+| 64 | 0.00 | 1 | 0.2543 | 329.913 | 8741 | 0 | ok |
+| 64 | 0.00 | 2 | 0.2744 | 305.690 | 8741 | 0 | ok |
+| 128 | 0.00 | 1 | 5.8319 | 14.384 | 9200 | 459 | ok |
+| 128 | 0.00 | 2 | 5.2232 | 16.060 | 9139 | 398 | ok |
+| 256 | 0.00 | 1 | 6.7623 | 12.405 | 9629 | 888 | ok |
+| 256 | 0.00 | 2 | 6.4788 | 12.948 | 9572 | 831 | ok |
+
+### Bracketing the cliff: 10 MiB, 0% loss, 3 runs each
+
+| window | loss | run | elapsed s | throughput Mbps | packets sent | retransmissions | verify |
+|---|---|---|---|---|---|---|---|
+| 64 | 0.00 | 1 | 0.2990 | 280.550 | 8741 | 0 | ok |
+| 64 | 0.00 | 2 | 0.3259 | 257.377 | 8741 | 0 | ok |
+| 64 | 0.00 | 3 | 0.2776 | 302.152 | 8741 | 0 | ok |
+| 72 | 0.00 | 1 | 2.7729 | 30.252 | 8749 | 8 | ok |
+| 72 | 0.00 | 2 | 2.7814 | 30.160 | 8749 | 8 | ok |
+| 72 | 0.00 | 3 | 1.8590 | 45.124 | 8746 | 5 | ok |
+| 80 | 0.00 | 1 | 4.6186 | 18.163 | 8845 | 104 | ok |
+| 80 | 0.00 | 2 | 3.7301 | 22.489 | 8822 | 81 | ok |
+| 80 | 0.00 | 3 | 4.0023 | 20.960 | 8826 | 85 | ok |
+| 88 | 0.00 | 1 | 4.0080 | 20.930 | 8862 | 121 | ok |
+| 88 | 0.00 | 2 | 3.9906 | 21.021 | 8862 | 121 | ok |
+| 88 | 0.00 | 3 | 4.1185 | 20.368 | 8854 | 113 | ok |
+| 96 | 0.00 | 1 | 3.6857 | 22.760 | 8889 | 148 | ok |
+| 96 | 0.00 | 2 | 3.6700 | 22.857 | 8907 | 166 | ok |
+| 96 | 0.00 | 3 | 3.6828 | 22.778 | 8854 | 113 | ok |
+| 112 | 0.00 | 1 | 4.2843 | 19.580 | 8901 | 160 | ok |
+| 112 | 0.00 | 2 | 3.3703 | 24.889 | 8893 | 152 | ok |
+| 112 | 0.00 | 3 | 3.3859 | 24.775 | 8948 | 207 | ok |
+| 128 | 0.00 | 1 | 3.3611 | 24.958 | 8904 | 163 | ok |
+| 128 | 0.00 | 2 | 5.5392 | 15.144 | 9103 | 362 | ok |
+| 128 | 0.00 | 3 | 4.6525 | 18.030 | 9043 | 302 | ok |
+
+**The ceiling is between window 64 and window 72.** Window 64 sustained
+257-302 Mbps across three runs with **zero** retransmissions. Window 72, a 12.5%
+larger window, fell to 30-45 Mbps with 5-8 retransmissions — roughly a 9x
+collapse for a 12.5% change. Nothing was dropping these packets except the
+kernel: at 0% injected loss on loopback, a retransmission means the receiver's
+socket queue overflowed and the datagram never reached userspace.
+
+Milestone 6 reasoned from `net.core.rmem_max = 212992` and an assumed ~2 KB
+charged per packet that the queue holds "on the order of 100 packets". The
+measured transition puts it lower: the break is at 64-72 packets in flight,
+implying roughly 212992/68 = **~3.1 KB charged per 1240-byte datagram**, not
+~2 KB. The shape of the reasoning held; the constant was optimistic by about
+50%.
+
+Note also that the collapse is *graceful* rather than catastrophic, and every
+single run verified byte-identical. Losing three quarters of the throughput to
+kernel drops is a performance failure, not a correctness one — the
+retransmission logic recovered all of it.
+
+### Condition B: 10 ms RTT through the delay proxy, 2 MiB, 0% loss
+
+| window | loss | run | elapsed s | throughput Mbps | packets sent | retransmissions | verify |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.00 | 1 | 19.8898 | 0.844 | 1750 | 0 | ok |
+| 1 | 0.00 | 2 | 19.5933 | 0.856 | 1750 | 0 | ok |
+| 2 | 0.00 | 1 | 10.0072 | 1.677 | 1750 | 0 | ok |
+| 2 | 0.00 | 2 | 9.7567 | 1.720 | 1750 | 0 | ok |
+| 4 | 0.00 | 1 | 4.9077 | 3.419 | 1750 | 0 | ok |
+| 4 | 0.00 | 2 | 5.0348 | 3.332 | 1750 | 0 | ok |
+| 8 | 0.00 | 1 | 2.5690 | 6.531 | 1750 | 0 | ok |
+| 8 | 0.00 | 2 | 2.5696 | 6.529 | 1750 | 0 | ok |
+| 16 | 0.00 | 1 | 1.3100 | 12.807 | 1750 | 0 | ok |
+| 16 | 0.00 | 2 | 1.3335 | 12.581 | 1750 | 0 | ok |
+| 32 | 0.00 | 1 | 0.6925 | 24.227 | 1750 | 0 | ok |
+| 32 | 0.00 | 2 | 0.6897 | 24.324 | 1750 | 0 | ok |
+| 64 | 0.00 | 1 | 0.3812 | 44.011 | 1750 | 0 | ok |
+| 64 | 0.00 | 2 | 0.4193 | 40.010 | 1750 | 0 | ok |
+| 128 | 0.00 | 1 | 0.2248 | 74.639 | 1750 | 0 | ok |
+| 128 | 0.00 | 2 | 0.2225 | 75.407 | 1750 | 0 | ok |
+| 256 | 0.00 | 1 | 0.1470 | 114.103 | 1750 | 0 | ok |
+| 256 | 0.00 | 2 | 0.1415 | 118.601 | 1750 | 0 | ok |
+
+**No cliff at all, at any window up to 256, with zero retransmissions
+throughout.** That is the useful contrast: the same window sizes that collapse
+on loopback are fine here. The receive queue overflows because of the *rate*
+packets arrive at, not the number in flight — loopback delivers a whole window
+back-to-back at memory speed, while a 5 ms one-way delay spaces them out enough
+for the receiver to keep up. Any statement of the form "window N is too large"
+is incomplete without the path it is too large for.
+
+Scaling here is close to the `window x chunk / RTT` prediction at the low end
+and bends at the high end:
+
+| window | doubling gain | measured Mbps |
+|---|---|---|
+| 1 | — | 0.844-0.856 |
+| 2 | 1.98x | 1.677-1.720 |
+| 4 | 1.99x | 3.332-3.419 |
+| 8 | 1.92x | 6.529-6.531 |
+| 16 | 1.95x | 12.581-12.807 |
+| 32 | 1.90x | 24.227-24.324 |
+| 64 | 1.74x | 40.010-44.011 |
+| 128 | 1.78x | 74.639-75.407 |
+| 256 | 1.53x | 114.103-118.601 |
+
+Doubling holds to within 10% through window 32 and decays to 1.53x by 256. The
+bend is not the bandwidth-delay product this time — it is the proxy. It is a
+single-threaded userspace process doing two `recvfrom`/`sendto` pairs and a
+heap operation per datagram, and by window 256 it is the slowest thing in the
+path. A kernel qdisc would not have this ceiling, which is one of the places
+the netem substitution genuinely costs something. Reported as measured, with
+the cause named rather than the numbers presented as the protocol's limit.
+

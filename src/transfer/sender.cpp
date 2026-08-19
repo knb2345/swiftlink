@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -186,13 +187,15 @@ TransferError send_file(net::UdpSocket& socket,
     return TransferError::kFileOpenFailed;
   }
 
-  const std::uint64_t total_chunks =
-      (file_size + config.chunk_size - 1) / config.chunk_size;
-  if (total_chunks > 0xFFFFFFFFULL) {
-    // sequence_number is 32 bits; a file needing more chunks than that cannot
-    // be addressed by this protocol version.
+  // sequence_number is 32 bits; a file needing more chunks than that cannot be
+  // addressed by this protocol version. See chunk_count() for why the check
+  // lives in the header rather than here.
+  const std::optional<std::uint32_t> chunks =
+      chunk_count(file_size, config.chunk_size);
+  if (!chunks.has_value()) {
     return TransferError::kProtocolViolation;
   }
+  const std::uint64_t total_chunks = *chunks;
 
   // Hashed before the transfer starts, so the digest covers the file as it was
   // when we began reading it.
@@ -287,6 +290,10 @@ TransferError send_file(net::UdpSocket& socket,
       break;  // nothing outstanding and nothing left to send
     }
 
+    // Already overdue is the common case under loss, not an anomaly: it just
+    // means a retransmission is owed before we sleep again. The receive below
+    // must still not block, which is why set_receive_timeout() refuses to turn
+    // a zero wait into SO_RCVTIMEO's "wait forever".
     auto wait = *deadline - Clock::now();
     if (wait < Clock::duration::zero()) {
       wait = Clock::duration::zero();

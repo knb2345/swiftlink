@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 #include "swiftlink/protocol/status.hpp"
@@ -30,6 +31,30 @@ inline constexpr std::chrono::milliseconds kDefaultRto{300};
 // Give up on a chunk after this many consecutive timeouts, so a dead peer ends
 // the transfer instead of hanging forever.
 inline constexpr int kMaxRetriesPerChunk = 50;
+
+// How many chunks a file of `file_size` bytes needs at `chunk_size` bytes each,
+// or nothing at all if that count cannot be addressed.
+//
+// The cap is the 32-bit sequence number, not the 64-bit byte offset: at the
+// default 1200-byte chunk it works out to roughly 5 TB. Wrapping instead of
+// refusing would silently alias chunk 2^32 onto chunk 0 and corrupt the file,
+// so the refusal is deliberate. Proper serial-number arithmetic (RFC 1982) is
+// the real fix and is listed in docs/todo.md.
+//
+// This lives here, taking a size rather than a file, specifically so the
+// boundary can be tested. The same check inside send_file() could only be
+// reached by supplying a ~5 TB file.
+[[nodiscard]] constexpr std::optional<std::uint32_t> chunk_count(
+    std::uint64_t file_size, std::size_t chunk_size) noexcept {
+  if (chunk_size == 0) {
+    return std::nullopt;
+  }
+  const std::uint64_t chunks = (file_size + chunk_size - 1) / chunk_size;
+  if (chunks > 0xFFFFFFFFULL) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint32_t>(chunks);
+}
 
 // Packets the sender may have outstanding at once. 32 x 1200 bytes = 38.4 KB
 // in flight, which fills a 12 Mbps path at a 25 ms RTT.

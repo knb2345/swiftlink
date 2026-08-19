@@ -4,6 +4,9 @@ Everything consciously left for a polish pass, with why. This is not a list of
 things that are broken — the system works end to end and every test passes —
 it is the list of things a second pass should address.
 
+Entries removed by the hardening pass are not listed here; what that pass
+measured, fixed and left alone is in [reliability.md](reliability.md).
+
 ## Measurement gaps
 
 - **M3 Condition B loss rates not measured.** Window 8 and 32 were measured at
@@ -14,11 +17,20 @@ it is the list of things a second pass should address.
 - **Only one run at window 1 under delay**, because each takes ~4 minutes. The
   M2 table has three runs at the equivalent setting.
 - **netem never used.** This kernel is built without it
-  (`CONFIG_NET_SCH_NETEM is not set`). All delay figures come from
-  `tools/delay_proxy.cpp`, which emulates delay only — no reordering,
-  duplication, or corruption. Running the matrix under real netem on a normal
-  kernel would be the honest cross-check, and would also let the reordering
-  path be exercised for the first time.
+  (`CONFIG_NET_SCH_NETEM is not set`) and carries no `sch_netem` module, so it
+  is unavailable at any privilege level. `tools/delay_proxy.cpp` now
+  reimplements netem's models in userspace — uniform and correlated loss,
+  Gilbert-Elliott burst loss, reordering, duplication, corruption — and
+  `scripts/impair_test.sh` drives the matrix through it. Running the same
+  matrix under real netem on a normal kernel is still the honest cross-check,
+  because the proxy is an extra process in the data path rather than a qdisc.
+- **netem's correlated loss is not reproducible by its stated rate.** The proxy
+  implements `get_crandom` faithfully, and faithfully inherits its defect: the
+  AR(1) recursion's stationary distribution clusters near 0.5, so
+  `--loss=5% --loss-corr=25%` delivers about 0.1%, not 5%. Use `--burst-loss`
+  (Gilbert-Elliott), whose marginal rate and mean burst length are both
+  actually achieved. The `--loss-corr` flag is kept for fidelity to netem and
+  carries a warning in the tool's usage.
 - **`SO_RCVBUF` ceiling not explored.** Window 128 collapses because the
   receive queue overflows at `net.core.rmem_max = 212992`. Raising it needs
   root, so the relationship was reasoned from the numbers rather than measured
@@ -51,20 +63,25 @@ it is the list of things a second pass should address.
 
 ## Robustness and security
 
-- **No rate limiting or handshake cookies.** Only START may allocate a session,
-  which stops the cheapest attack, but nothing stops a flood of STARTs from
-  exhausting memory and file descriptors. A SYN-cookie-style stateless
-  handshake would fix it properly.
+- **No handshake cookies.** `ServerConfig::max_sessions` (default 256) now caps
+  simultaneous sessions and answers anything beyond it with `kServerBusy`, so a
+  flood costs a bounded amount of state instead of an unbounded one —
+  `scripts/hostile_input_test.sh` fires 4000 STARTs from one address and
+  watches ~1900 of them get refused. That is a mitigation, not the fix: a
+  stranger can still occupy all 256 slots until the idle sweep reclaims them,
+  and legitimate clients are refused while they do. A SYN-cookie-style
+  stateless handshake, where the server keeps no state until the client proves
+  it can receive, is the real answer. Per-source rate limiting is the cheaper
+  partial one.
 - **Session ids are `mt19937_64` seeded from `random_device`, not a CSPRNG.**
   Fine for collision avoidance, not for unguessability by a determined
   attacker. Should be `getrandom(2)`.
-- **Filename collisions are unhandled.** Two concurrent transfers advertising
-  the same name write to the same path and corrupt each other. Needs either
-  per-session temporary files renamed on completion, or outright rejection.
-- **Partial files are left on disk** when a session is abandoned or fails
-  integrity. Writing to a temporary name and renaming only after the SHA-256
-  check passes would mean a file in the output directory is always complete
-  and verified.
+- **Filename collisions resolve last-writer-wins.** Concurrent transfers no
+  longer corrupt each other — each writes to `.swiftlink-<session>.partial` and
+  renames over the final name only after its SHA-256 verifies — but two
+  transfers claiming one name still end with one file, whichever finished
+  last. Rejecting the second START, or disambiguating the name, is the
+  remaining decision.
 - **Filename sanitisation rejects all non-ASCII**, which is stricter than POSIX
   and would break international filenames. Deliberate for now; would need a
   proper UTF-8 validator to relax safely.
@@ -78,24 +95,25 @@ it is the list of things a second pass should address.
 
 ## Testing
 
-- **Sub-chunk and exact-chunk-multiple integration cases skipped** at the
-  user's request. The unit tests cover the chunk-count arithmetic and M2 tested
-  these sizes manually (1199/1200/1201/2400 all verified), but they are not in
-  the automated suite.
-- **No test injects packet corruption**, so the CRC32 rejection path is proven
-  only by unit tests on the primitive, never end to end. A proxy that flips a
-  bit would close that gap.
-- **No test forces reordering**, since loopback does not reorder and the delay
-  proxy preserves order. The out-of-order receive path is therefore exercised
-  only by unit tests, not by an actual reordered transfer.
-- **No fuzzing of `deserialize`.** It is the one function that parses hostile
-  input, so it is the obvious candidate for a fuzz target.
-- **ASan/UBSan/TSan never run.** A sanitiser build in CI would be cheap.
-- **Concurrency tested at 4 sessions.** Nothing has probed hundreds.
+- **ASan/UBSan/TSan never run.** A sanitiser build in CI would be cheap, and is
+  the obvious next thing given how much hostile input the server now eats.
+- **`deserialize` has no coverage-guided fuzzer.**
+  `scripts/hostile_input_test.sh` throws several thousand random and
+  deliberately-malformed datagrams at it, which is dumb fuzzing: it proves the
+  decoder survives, not that its branches were reached. libFuzzer or AFL++
+  against `deserialize` directly, with a corpus, is the real version.
+- **The impairment matrix is single-client.** `tools/delay_proxy` tracks one
+  client address, so loss and reordering cannot be combined with concurrency.
+  The two are measured separately (`scripts/impair_test.sh` and
+  `scripts/concurrency_test.sh`); a many-to-one impairing proxy would let them
+  be measured together, which is the configuration a real deployment has.
+- **No transfer above 4 GiB has been run.** The chunk-count cap itself is now
+  tested at its exact boundary (`transfer::chunk_count`, exercised in
+  `tests/session_tests.cpp`), but that is arithmetic, not I/O: nothing has moved
+  enough bytes for a 32-bit truncation elsewhere in the pipeline to surface.
+- **No test covers a real network path.** Everything runs over loopback with an
+  emulator in between. Two hosts on a real link would be the honest check.
 
 ## Build and tooling
 
-- **`CMAKE_BUILD_TYPE` defaults to Debug**, where SHA-256 runs at 28 MB/s
-  against 179 MB/s at `-O2`. Any benchmark that forgets `-DCMAKE_BUILD_TYPE=Release`
-  is really measuring unoptimised crypto. Worth a warning at configure time.
 - **No CI.** No install target. No `clang-format`/`clang-tidy` config.
